@@ -9,7 +9,7 @@ Left sidebar:
     (po.date_order) and the inward date filter (pk.date_done).
   - Company / Vendor / Category multi-select filters. Their options are
     fetched automatically from the Lakehouse the moment the app loads
-    (via DISTINCT queries), before the user ever clicks "Run Query".
+    (via DISTINCT queries), before the user ever clicks "Fetch Data".
     Vendor list includes a synthetic "None" option for products with no
     vendor assigned.
 
@@ -396,7 +396,7 @@ def build_query_and_params(start_str, end_str, vendors, categories, companies):
 def get_filter_options(_conn_str):
     """Fetch distinct Company / Vendor / Category values straight from the
     source tables, so the sidebar filters are populated automatically as
-    soon as the app loads — before the user clicks Run Query."""
+    soon as the app loads — before the user clicks Fetch Data."""
     excluded_sql = ",".join(["?"] * len(EXCLUDED_COMPANIES))
 
     with pyodbc.connect(_conn_str) as conn:
@@ -468,7 +468,7 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("**📅 Date Range**")
 start_date = st.sidebar.date_input("Start Date", value=date(2026, 8, 1))
 end_date = st.sidebar.date_input("End Date", value=date(2026, 8, 9))
-st.sidebar.caption("Applies to both Sales (date_order) and Inward (date_done).")
+# st.sidebar.caption("Applies to both Sales (date_order) and Inward (date_done).")
 
 st.sidebar.markdown("---")
 
@@ -508,7 +508,7 @@ selected_categories = st.sidebar.multiselect(
 )
 
 st.sidebar.markdown("---")
-run_clicked = st.sidebar.button("▶️  Run Query", type="primary", use_container_width=True)
+run_clicked = st.sidebar.button("▶️  Fetch Data", type="primary", use_container_width=True)
 
 col_a, col_b = st.sidebar.columns(2)
 with col_a:
@@ -620,4 +620,4 @@ if run_clicked:
             except Exception as e:
                 st.error(f"Query failed: {e}")
 else:
-    st.info("Set your filters on the left, then click **Run Query** to load the report.")
+    st.info("Set your filters on the left, then click **Fetch Data** to load the report.")
