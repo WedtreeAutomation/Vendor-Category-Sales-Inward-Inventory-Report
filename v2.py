@@ -114,7 +114,7 @@ NONE_VENDOR_LABEL = "None"
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 2rem; }
+    .block-container { padding-top:4 rem; }
     [data-testid="stMetric"] {
         background: #f8fafc;
         border: 1px solid #e2e8f0;
