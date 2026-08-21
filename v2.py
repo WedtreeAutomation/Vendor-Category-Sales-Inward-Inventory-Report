@@ -392,7 +392,7 @@ def build_query_and_params(start_str, end_str, vendors, categories, companies):
     return sql, params
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading filter options from the Lakehouse...")
+@st.cache_data(ttl=3600, show_spinner=True)
 def get_filter_options(_conn_str):
     """Fetch distinct Company / Vendor / Category values straight from the
     source tables, so the sidebar filters are populated automatically as
