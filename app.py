@@ -1132,9 +1132,10 @@ ORDER BY
 
 SALES_SQL = PRODUCT_BASE + """
 ,
-sales_detail AS (
+pos_sales AS (
     SELECT
         po.company_id_name AS company,
+        CAST(po.picking_ids AS VARCHAR(MAX)) AS picking_ids,
         CAST(pol.product_id AS VARCHAR(50)) AS product_id,
         SUM(pol.qty) AS sale_qty,
         SUM(pol.price_subtotal_incl) AS sale_value
@@ -1156,10 +1157,46 @@ sales_detail AS (
           'TN BILLING 4 (not used)',
           'HYD BILLING - 4 (not used)',
           'Vizag Billing 3 (not used)'
-      )
+    )
     GROUP BY
         po.company_id_name,
+        CAST(po.picking_ids AS VARCHAR(MAX)),
         CAST(pol.product_id AS VARCHAR(50))
+),
+lot_moves AS (
+    SELECT
+        CAST(pk.id AS VARCHAR(50)) AS picking_id,
+        CAST(sml.product_id AS VARCHAR(50)) AS product_id,
+        NULLIF(sml.lot_id_name, 'False') AS lot_number,
+        SUM(ABS(COALESCE(sml.quantity_product_uom, sml.quantity, 0))) AS lot_qty
+    FROM WT_LH_Silver.Odoo.stock_picking pk
+    INNER JOIN WT_LH_Silver.Odoo.stock_move_line sml
+        ON NULLIF(CAST(sml.picking_id AS VARCHAR(50)), 'False') =
+           CAST(pk.id AS VARCHAR(50))
+    WHERE pk.state = 'done'
+      AND pk.picking_type_code = 'outgoing'
+      AND sml.state = 'done'
+    GROUP BY
+        CAST(pk.id AS VARCHAR(50)),
+        CAST(sml.product_id AS VARCHAR(50)),
+        NULLIF(sml.lot_id_name, 'False')
+),
+sales_detail AS (
+    SELECT
+        ps.company,
+        ps.product_id,
+        COALESCE(lm.lot_number, 'No lot recorded') AS lot_number,
+        COALESCE(lm.lot_qty, ps.sale_qty) AS sale_qty,
+        CASE
+            WHEN lm.lot_qty IS NULL THEN ps.sale_value
+            WHEN ps.sale_qty <> 0 THEN ps.sale_value * lm.lot_qty / ps.sale_qty
+            ELSE 0
+        END AS sale_value
+    FROM pos_sales ps
+    LEFT JOIN lot_moves lm
+        ON (',' + REPLACE(REPLACE(REPLACE(ps.picking_ids, '[', ''), ']', ''), ' ', '') + ',')
+           LIKE '%,' + lm.picking_id + ',%'
+       AND lm.product_id = ps.product_id
 )
 SELECT
     s.company,
@@ -1170,6 +1207,7 @@ SELECT
     p.category,
     p.sp,
     p.cp,
+    s.lot_number,
     s.sale_qty,
     s.sale_value,
     COALESCE(pi.image_1920, '') AS image_1920
@@ -1394,6 +1432,7 @@ def render_sales_card(row):
         f'{safe_html(row.get("category", ""))}<br>{safe_html(row.get("vendor", ""))}'
         '</div>',
         _detail_row("SKU", safe_html(row.get("sku", ""))),
+        _detail_row("Lot No.", safe_html(row.get("lot_number", ""))),
         _detail_row("Sold Qty", f"{sale_qty:g}"),
         _detail_row("Sale value", f"₹{sale_value:,.0f}"),
         '<div class="price-row">'
@@ -1529,12 +1568,34 @@ def render_main_report():
             company_options, vendor_options, category_options = [], [], []
 
     st.sidebar.markdown("**🏢 Company**")
-    selected_companies = st.sidebar.multiselect(
+    # selected_companies = st.sidebar.multiselect(
+    #     "Company",
+    #     options=company_options,
+    #     default=[c for c in restore_companies if c in company_options],
+    #     label_visibility="collapsed",
+    # )
+
+    company_display_map = {
+    c: c.split(" - ", 1)[-1] if " - " in c else c
+    for c in company_options
+}
+
+    selected_display = st.sidebar.multiselect(
         "Company",
-        options=company_options,
-        default=[c for c in restore_companies if c in company_options],
+        options=list(company_display_map.values()),
+        default=[
+            company_display_map[c]
+            for c in restore_companies
+            if c in company_display_map
+        ],
         label_visibility="collapsed",
     )
+
+    selected_companies = [
+        company
+        for company, display in company_display_map.items()
+        if display in selected_display
+    ]
 
     st.sidebar.markdown("**🏷️ Vendor**")
     selected_vendors = st.sidebar.multiselect(
