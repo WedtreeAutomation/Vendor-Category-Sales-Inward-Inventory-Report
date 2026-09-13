@@ -20,9 +20,33 @@ Why this is faster:
 - No more DRILL_APP_URL / MAIN_APP_URL secrets or cross-port navigation.
   Drill-through links are just `?drill=...` on the same app.
 
-Routing (no separate pages/files needed):
-    no `drill` query param   -> main report view
-    `drill=sales|available`  -> drill-through product-card view
+DATE-FIRST FETCH + IN-MEMORY FILTERING (this revision)
+--------------------------------------------------------------------
+The report is now split into two stages so that changing Vendor /
+Category / Company never re-hits SQL Server:
+
+  1. FETCH (SQL, slow-ish, only runs on "Fetch Data"):
+     `get_aggregate_data(conn_str, start, end)` pulls the report
+     aggregated by (vendor, category, company) for the selected date
+     range ONLY — no vendor/category/company filtering in the WHERE
+     clause. This result is cached with `st.cache_data(ttl=21600)`
+     (6 hours), keyed on the connection string + date range. As long
+     as nobody clicks "Fetch Data" with a *different* date range (or
+     the 6 hours expire), this never re-queries the Lakehouse — every
+     user/session sharing that date range gets the cached DataFrame.
+
+  2. FILTER (pandas, instant, runs on every rerun):
+     Vendor / Category / Company are now applied with
+     `filter_report_df(...)` directly on the cached DataFrame that's
+     sitting in memory. Toggling these filters, paging, sorting, and
+     the "Top vendors" chart all operate on that in-memory frame —
+     no network round trip, no spinner.
+
+The filter *options* themselves (which vendors/categories/companies
+show up in the multiselects) are derived from the fetched DataFrame
+rather than a separate SQL round trip, which removes one more query
+from the critical path. They naturally scope themselves to "things
+that actually appear in this date range."
 
 Set these in Streamlit secrets:
     SQL_ENDPOINT, DATABASE, TENANT_ID, CLIENT_ID, CLIENT_SECRET
@@ -86,6 +110,10 @@ NONE_VENDOR_LABEL = "None"
 DATA_TTL_SECONDS = 3600          # image bytes cache lifetime
 MAX_WORKERS = 8                  # parallel OneLake image fetches
 ONELAKE_ACCOUNT_URL = "https://onelake.dfs.fabric.microsoft.com"
+
+# How long a date-range fetch stays valid in memory before a fresh
+# "Fetch Data" click is forced to re-query the Lakehouse.
+AGGREGATE_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
 # =====================================================================
 # Styling (merged: hero/report-table theme + drill-through card theme)
@@ -356,6 +384,21 @@ st.markdown(
         color:var(--notice-text);
         font-size:13.5px;
         margin-top:2px;
+    }
+
+    .cache-badge {
+        display:inline-flex;
+        align-items:center;
+        gap:6px;
+        background: var(--st-bg2);
+        border: 1px solid var(--card-border);
+        border-radius: 999px;
+        padding: 4px 12px;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--st-text);
+        opacity: .85;
+        margin: 4px 0 14px 0;
     }
 
     .report-table-wrap {
@@ -717,6 +760,12 @@ def image_to_data_uri(img: Image.Image, fmt: str = "JPEG", quality: int = 82) ->
 
 # =====================================================================
 # Main report SQL
+#
+# NOTE: This is now filtered by DATE RANGE ONLY. Vendor / Category /
+# Company are intentionally NOT part of the WHERE clause anymore —
+# they're applied afterwards, in pandas, on the cached result (see
+# filter_report_df / get_aggregate_data below). This keeps the query
+# shape (and therefore the cache key) stable across filter tweaks.
 # =====================================================================
 
 QUERY_TEMPLATE = """
@@ -862,9 +911,6 @@ SELECT
     SUM(inward_value) AS inward_value,
     company AS company_id_name
 FROM consolidated
-WHERE {vendor_clause}
-  AND {category_clause}
-  AND {company_clause}
 GROUP BY
     vendor,
     category,
@@ -876,97 +922,64 @@ ORDER BY
 """
 
 
-def build_in_clause(column, values, params):
-    if not values:
-        return "1=1"
-    placeholders = ",".join(["?"] * len(values))
-    params.extend(values)
-    return f"{column} IN ({placeholders})"
-
-
-def build_vendor_clause(values, params):
-    if not values:
-        return "1=1"
-
-    include_none = NONE_VENDOR_LABEL in values
-    real = [v for v in values if v != NONE_VENDOR_LABEL]
-    conditions = []
-
-    if real:
-        placeholders = ",".join(["?"] * len(real))
-        params.extend(real)
-        conditions.append(f"vendor IN ({placeholders})")
-
-    if include_none:
-        conditions.append("vendor IS NULL")
-
-    return "(" + " OR ".join(conditions) + ")" if conditions else "1=1"
-
-
-def build_query_and_params(start_str, end_str, vendors, categories, companies):
+def build_query_and_params(start_str, end_str):
+    """Date range is the ONLY filter baked into SQL now. Params are
+    just the two date bounds, used twice (sales window, inward window)."""
     params = [start_str, end_str, start_str, end_str]
-    vendor_clause = build_vendor_clause(vendors, params)
-    category_clause = build_in_clause("category", categories, params)
-    company_clause = build_in_clause("company", companies, params)
-
-    sql = QUERY_TEMPLATE.format(
-        vendor_clause=vendor_clause,
-        category_clause=category_clause,
-        company_clause=company_clause,
-    )
-    return sql, params
+    return QUERY_TEMPLATE, params
 
 
-# =====================================================================
-# Filter options
-# =====================================================================
-
-FILTER_OPTIONS_BATCH_SQL = """
-SELECT DISTINCT categ_id_name
-FROM WT_LH_Silver.Odoo.product_product
-WHERE categ_id_name IS NOT NULL
-  AND LOWER(categ_id_name) NOT LIKE '%admin%'
-ORDER BY categ_id_name;
-
-SELECT DISTINCT vendor_id_name
-FROM WT_LH_Silver.Odoo.product_template
-WHERE vendor_id_name IS NOT NULL
-ORDER BY vendor_id_name;
-
-SELECT DISTINCT company_id_name FROM (
-    SELECT company_id_name FROM WT_LH_Silver.Odoo.pos_order
-    UNION
-    SELECT company_id_name FROM WT_LH_Silver.Odoo.stock_picking
-    UNION
-    SELECT company_id_name FROM WT_LH_Silver.Odoo.stock_quant_n1
-) t
-WHERE company_id_name IS NOT NULL
-  AND company_id_name NOT IN ({excluded_sql})
-ORDER BY company_id_name;
-"""
+@st.cache_data(ttl=AGGREGATE_CACHE_TTL_SECONDS, show_spinner=False)
+def get_aggregate_data(conn_str, start_str, end_str):
+    """The one and only SQL round trip for the report. Cached for
+    AGGREGATE_CACHE_TTL_SECONDS (6 hours), keyed on the connection
+    string + date range. Every Vendor/Category/Company tweak below
+    reuses this exact DataFrame — no new query."""
+    sql, params = build_query_and_params(start_str, end_str)
+    return run_query(conn_str, sql, params)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_filter_options(conn_str):
-    excluded_sql = ",".join(["?"] * len(EXCLUDED_COMPANIES))
-    sql = FILTER_OPTIONS_BATCH_SQL.format(excluded_sql=excluded_sql)
+def filter_report_df(df, vendors, categories, companies):
+    """Apply Vendor / Category / Company filters entirely in pandas,
+    against the already-fetched (date-scoped) DataFrame. No SQL."""
+    if df is None or df.empty:
+        return df
 
-    conn = get_live_connection(conn_str)
-    cur = conn.cursor()
-    cur.execute(sql, EXCLUDED_COMPANIES)
+    filtered = df
 
-    categories = [r[0] for r in cur.fetchall()]
-    cur.nextset()
-    vendors = [r[0] for r in cur.fetchall()]
-    cur.nextset()
-    companies = [r[0] for r in cur.fetchall()]
-    cur.close()
+    if companies:
+        filtered = filtered[filtered["company_id_name"].isin(companies)]
 
-    companies = [
-        c for c in companies
-        if c not in COMPANIES_HIDDEN_FROM_FILTER
-    ]
+    if categories:
+        filtered = filtered[filtered["categ_id_name"].isin(categories)]
+
+    if vendors:
+        include_none = NONE_VENDOR_LABEL in vendors
+        real = [v for v in vendors if v != NONE_VENDOR_LABEL]
+        mask = pd.Series(False, index=filtered.index)
+        if real:
+            mask = mask | filtered["Vendor"].isin(real)
+        if include_none:
+            mask = mask | filtered["Vendor"].isna()
+        filtered = filtered[mask]
+
+    return filtered
+
+
+def derive_filter_options(df):
+    """Vendor/Category/Company choices derived from the fetched
+    DataFrame itself (no extra SQL round trip). Naturally scoped to
+    whatever actually appears in the selected date range."""
+    if df is None or df.empty:
+        return [], [NONE_VENDOR_LABEL], []
+
+    categories = sorted(df["categ_id_name"].dropna().unique().tolist())
+
+    vendors = sorted(df["Vendor"].dropna().unique().tolist())
     vendors = [NONE_VENDOR_LABEL] + vendors
+
+    companies = sorted(df["company_id_name"].dropna().unique().tolist())
+    companies = [c for c in companies if c not in COMPANIES_HIDDEN_FROM_FILTER]
 
     return companies, vendors, categories
 
@@ -1251,17 +1264,17 @@ def _decode_list(s):
     return [v for v in s.split(_LIST_SEP) if v] if s else []
 
 
-def build_report_state_params(result):
+def build_report_state_params(start_date, end_date, companies, vendors, categories):
     """The applied-filter state of the main report, packed so it can be
     carried through a drill-through link and back again. A drill-through
     click is a full page navigation (new Streamlit session), so this has
     to live in the URL rather than st.session_state to survive it."""
     return {
-        "r_start": result["start_date"].isoformat(),
-        "r_end": result["end_date"].isoformat(),
-        "r_companies": _encode_list(result["companies"]),
-        "r_vendors": _encode_list(result["vendors"]),
-        "r_categories": _encode_list(result["categories"]),
+        "r_start": start_date.isoformat(),
+        "r_end": end_date.isoformat(),
+        "r_companies": _encode_list(companies),
+        "r_vendors": _encode_list(vendors),
+        "r_categories": _encode_list(categories),
     }
 
 
@@ -1497,6 +1510,10 @@ def resolve_images_for_df(df: pd.DataFrame) -> pd.DataFrame:
 # View: Main report
 # =====================================================================
 
+def _reset_page():
+    st.session_state["page"] = 1
+
+
 def render_main_report():
     st.markdown(
         '<div class="hero">'
@@ -1534,86 +1551,17 @@ def render_main_report():
     except Exception:
         default_end_date = date(2026, 8, 9)
 
-    st.sidebar.markdown("## 🔎 Filters")
+    # -----------------------------------------------------------------
+    # STAGE 1 — Date range + Fetch Data. This is the ONLY thing that can
+    # trigger a SQL round trip. Everything else below (Vendor/Category/
+    # Company) filters the in-memory result once it's loaded.
+    # -----------------------------------------------------------------
+    st.sidebar.markdown("## 🔎 Report")
     st.sidebar.markdown("---")
-
     st.sidebar.markdown("**📅 Date Range**")
     start_date = st.sidebar.date_input("Start Date", value=default_start_date)
     end_date = st.sidebar.date_input("End Date", value=default_end_date)
 
-    st.sidebar.markdown("---")
-
-    if not connection_is_configured():
-        st.sidebar.warning(
-            "Connection details aren't configured. Add SQL_ENDPOINT, DATABASE, "
-            "TENANT_ID, CLIENT_ID and CLIENT_SECRET to Streamlit secrets."
-        )
-        company_options, vendor_options, category_options = [], [], []
-    else:
-        try:
-            conn_str_for_options = build_connection_string(
-                SQL_ENDPOINT,
-                DATABASE,
-                CLIENT_ID,
-                CLIENT_SECRET,
-                TENANT_ID,
-            )
-            with st.sidebar:
-                with st.spinner("Loading filters..."):
-                    company_options, vendor_options, category_options = get_filter_options(
-                        conn_str_for_options
-                    )
-        except Exception as e:
-            st.sidebar.error(f"Couldn't load filter options: {e}")
-            company_options, vendor_options, category_options = [], [], []
-
-    st.sidebar.markdown("**🏢 Company**")
-    # selected_companies = st.sidebar.multiselect(
-    #     "Company",
-    #     options=company_options,
-    #     default=[c for c in restore_companies if c in company_options],
-    #     label_visibility="collapsed",
-    # )
-
-    company_display_map = {
-    c: c.split(" - ", 1)[-1] if " - " in c else c
-    for c in company_options
-}
-
-    selected_display = st.sidebar.multiselect(
-        "Company",
-        options=list(company_display_map.values()),
-        default=[
-            company_display_map[c]
-            for c in restore_companies
-            if c in company_display_map
-        ],
-        label_visibility="collapsed",
-    )
-
-    selected_companies = [
-        company
-        for company, display in company_display_map.items()
-        if display in selected_display
-    ]
-
-    st.sidebar.markdown("**🏷️ Vendor**")
-    selected_vendors = st.sidebar.multiselect(
-        "Vendor",
-        options=vendor_options,
-        default=[v for v in restore_vendors if v in vendor_options],
-        label_visibility="collapsed",
-    )
-
-    st.sidebar.markdown("**📦 Category**")
-    selected_categories = st.sidebar.multiselect(
-        "Category",
-        options=category_options,
-        default=[c for c in restore_categories if c in category_options],
-        label_visibility="collapsed",
-    )
-
-    st.sidebar.markdown("---")
     run_clicked = st.sidebar.button(
         "▶️  Fetch Data",
         type="primary",
@@ -1621,34 +1569,24 @@ def render_main_report():
     )
 
     col_a, col_b = st.sidebar.columns(2)
-
     with col_a:
-        if st.button("↻ Refresh filters", use_container_width=True):
-            get_filter_options.clear()
-            st.rerun()
-
+        if st.button("↻ Refetch range", use_container_width=True):
+            # Force-bypass the 6h cache for this exact date range.
+            get_aggregate_data.clear()
+            run_query.clear()
+            run_clicked = True
     with col_b:
-        if st.button("🗑️ Clear cache", use_container_width=True):
+        if st.button("🗑️ Clear all cache", use_container_width=True):
             run_query.clear()
             get_connection.clear()
-            get_filter_options.clear()
+            get_aggregate_data.clear()
             load_image_cached.clear()
+            st.session_state.pop("raw_df", None)
+            st.session_state.pop("raw_meta", None)
             st.sidebar.info("Cache cleared.")
-
-    query_sql, query_params = build_query_and_params(
-        start_date.isoformat(),
-        end_date.isoformat(),
-        selected_vendors,
-        selected_categories,
-        selected_companies,
-    )
-
-    if "result" not in st.session_state:
-        st.session_state["result"] = None
 
     if "page" not in st.session_state:
         st.session_state["page"] = 1
-
     if "page_size" not in st.session_state:
         st.session_state["page_size"] = 25
 
@@ -1658,10 +1596,16 @@ def render_main_report():
     # "Fetch Data" click.
     auto_restore = (
         not run_clicked
-        and st.session_state["result"] is None
+        and "raw_df" not in st.session_state
         and has_restore_state
         and connection_is_configured()
     )
+
+    if not connection_is_configured():
+        st.sidebar.warning(
+            "Connection details aren't configured. Add SQL_ENDPOINT, DATABASE, "
+            "TENANT_ID, CLIENT_ID and CLIENT_SECRET to Streamlit secrets."
+        )
 
     if run_clicked or auto_restore:
         if start_date > end_date:
@@ -1670,36 +1614,110 @@ def render_main_report():
             st.error("Connection details aren't configured.")
         else:
             conn_str = build_connection_string(
-                SQL_ENDPOINT,
-                DATABASE,
-                CLIENT_ID,
-                CLIENT_SECRET,
-                TENANT_ID,
+                SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID,
             )
-
             t0 = time.time()
-
             with st.spinner("Running query against the Lakehouse..."):
                 try:
-                    df = run_query(conn_str, query_sql, query_params)
-
-                    st.session_state["result"] = {
-                        "df": df,
+                    raw_df = get_aggregate_data(
+                        conn_str, start_date.isoformat(), end_date.isoformat()
+                    )
+                    st.session_state["raw_df"] = raw_df
+                    st.session_state["raw_meta"] = {
                         "start_date": start_date,
                         "end_date": end_date,
-                        "companies": selected_companies,
-                        "vendors": selected_vendors,
-                        "categories": selected_categories,
                         "elapsed": time.time() - t0,
+                        "fetched_at": datetime.now(),
                     }
-                    st.session_state["page"] = 1
+                    _reset_page()
+                    # A brand-new fetch means any previously selected
+                    # filters may no longer apply - reseed from restore
+                    # state (or clear) so stale selections don't hide data.
+                    # The company widget's key stores DISPLAY names, so
+                    # translate restore_companies (full names) through the
+                    # same display-map logic used to render the widget.
+                    company_opts_now, _, _ = derive_filter_options(raw_df)
+                    company_display_map_now = {
+                        c: c.split(" - ", 1)[-1] if " - " in c else c
+                        for c in company_opts_now
+                    }
+                    if auto_restore:
+                        st.session_state["flt_vendor"] = list(restore_vendors)
+                        st.session_state["flt_category"] = list(restore_categories)
+                        st.session_state["flt_company_display"] = [
+                            company_display_map_now[c]
+                            for c in restore_companies
+                            if c in company_display_map_now
+                        ]
+                    else:
+                        st.session_state["flt_vendor"] = []
+                        st.session_state["flt_category"] = []
+                        st.session_state["flt_company_display"] = []
                 except Exception as e:
                     st.error(f"Query failed: {e}")
 
-    result = st.session_state["result"]
+    raw_df = st.session_state.get("raw_df")
+    raw_meta = st.session_state.get("raw_meta")
 
-    if result is not None:
-        df = result["df"]
+    # -----------------------------------------------------------------
+    # STAGE 2 — Vendor / Category / Company filters, computed purely
+    # from the already-fetched DataFrame. Selecting these never touches
+    # SQL Server again; it's a pandas .isin() on data already in memory.
+    # -----------------------------------------------------------------
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## 🧰 Refine (instant, no re-query)")
+
+    if raw_df is None:
+        st.sidebar.caption("Fetch a date range first to unlock these filters.")
+        company_options, vendor_options, category_options = [], [], []
+    else:
+        company_options, vendor_options, category_options = derive_filter_options(raw_df)
+
+        company_display_map = {
+            c: c.split(" - ", 1)[-1] if " - " in c else c
+            for c in company_options
+        }
+
+        st.sidebar.markdown("**🏢 Company**")
+        # No `default=` here on purpose: the widget's initial value comes
+        # from st.session_state["flt_company_display"] if it was already
+        # seeded (see the restore/reset logic in the fetch block above).
+        # This is the supported pattern for pre-setting a keyed widget's
+        # value without Streamlit's "set both via session_state and via
+        # default" conflict.
+        selected_display = st.sidebar.multiselect(
+            "Company",
+            options=list(company_display_map.values()),
+            key="flt_company_display",
+            label_visibility="collapsed",
+            on_change=_reset_page,
+        )
+        selected_companies = [
+            company
+            for company, display in company_display_map.items()
+            if display in selected_display
+        ]
+
+        st.sidebar.markdown("**🏷️ Vendor**")
+        selected_vendors = st.sidebar.multiselect(
+            "Vendor",
+            options=vendor_options,
+            key="flt_vendor",
+            label_visibility="collapsed",
+            on_change=_reset_page,
+        )
+
+        st.sidebar.markdown("**📦 Category**")
+        selected_categories = st.sidebar.multiselect(
+            "Category",
+            options=category_options,
+            key="flt_category",
+            label_visibility="collapsed",
+            on_change=_reset_page,
+        )
+
+    if raw_df is not None:
+        df = filter_report_df(raw_df, selected_vendors, selected_categories, selected_companies)
 
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Rows", f"{len(df):,}")
@@ -1707,7 +1725,15 @@ def render_main_report():
         k3.metric("Inward Value", f"₹{df['inward_value'].sum():,.0f}")
         k4.metric("Available Value", f"₹{df['available_value'].sum():,.0f}")
 
-        st.caption(f"Fetched in {result['elapsed']:.2f}s")
+        age_seconds = (datetime.now() - raw_meta["fetched_at"]).total_seconds()
+        age_minutes = int(age_seconds // 60)
+        remaining_hours = max(0, (AGGREGATE_CACHE_TTL_SECONDS - age_seconds) / 3600)
+        st.markdown(
+            f'<div class="cache-badge">🕒 Fetched in {raw_meta["elapsed"]:.2f}s · '
+            f'in memory for {age_minutes} min · '
+            f'valid ~{remaining_hours:.1f}h more before a re-fetch is needed</div>',
+            unsafe_allow_html=True,
+        )
 
         st.markdown(
             '<div class="notice-card">'
@@ -1718,7 +1744,8 @@ def render_main_report():
             '<b>Quantity</b> and <b>stock value</b> figures reflect '
             '<b>current inventory on hand</b> — they are <u>not</u> '
             'scoped to the selected date range. Only Sales and '
-            'Inward figures are filtered by date.'
+            'Inward figures are filtered by date. Vendor / Category / '
+            'Company below filter the already-fetched data instantly.'
             '</div>'
             '</div>'
             '</div>',
@@ -1726,30 +1753,15 @@ def render_main_report():
         )
 
         filter_pills = []
-
-        if result["companies"]:
-            filter_pills += [
-                f'<span class="pill">🏢 {safe_html(c)}</span>'
-                for c in result["companies"]
-            ]
-
-        if result["vendors"]:
-            filter_pills += [
-                f'<span class="pill">🏷️ {safe_html(v)}</span>'
-                for v in result["vendors"]
-            ]
-
-        if result["categories"]:
-            filter_pills += [
-                f'<span class="pill">📦 {safe_html(c)}</span>'
-                for c in result["categories"]
-            ]
+        if selected_companies:
+            filter_pills += [f'<span class="pill">🏢 {safe_html(c)}</span>' for c in selected_companies]
+        if selected_vendors:
+            filter_pills += [f'<span class="pill">🏷️ {safe_html(v)}</span>' for v in selected_vendors]
+        if selected_categories:
+            filter_pills += [f'<span class="pill">📦 {safe_html(c)}</span>' for c in selected_categories]
 
         if filter_pills:
-            st.markdown(
-                f'<div class="filter-pill-row">{"".join(filter_pills)}</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f'<div class="filter-pill-row">{"".join(filter_pills)}</div>', unsafe_allow_html=True)
 
         st.markdown("### Report")
         st.caption(
@@ -1810,9 +1822,12 @@ def render_main_report():
 
         render_report_table(
             page_df,
-            result["start_date"],
-            result["end_date"],
-            build_report_state_params(result),
+            raw_meta["start_date"],
+            raw_meta["end_date"],
+            build_report_state_params(
+                raw_meta["start_date"], raw_meta["end_date"],
+                selected_companies, selected_vendors, selected_categories,
+            ),
         )
 
         st.caption(
@@ -1820,13 +1835,11 @@ def render_main_report():
             f"of {total_rows:,}"
         )
 
-        b1, b2, b3, b4, b5 = st.columns([2, 2, 2, 1, 1])
-
+        b4, b5 = st.columns([1, 1])
         with b4:
             if st.button("← Prev ", use_container_width=True, disabled=(page <= 1), key="prev_bottom"):
                 st.session_state["page"] = page - 1
                 st.rerun()
-
         with b5:
             if st.button("Next → ", use_container_width=True, disabled=(page >= total_pages), key="next_bottom"):
                 st.session_state["page"] = page + 1
@@ -1845,19 +1858,20 @@ def render_main_report():
                 st.bar_chart(top_vendors)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8")
-
         st.download_button(
             "⬇️ Download CSV",
             data=csv_bytes,
             file_name=(
                 f"vendor_category_report_"
-                f"{result['start_date']}_{result['end_date']}.csv"
+                f"{raw_meta['start_date']}_{raw_meta['end_date']}.csv"
             ),
             mime="text/csv",
         )
     else:
         st.info(
-            "Set your filters on the left, then click **Fetch Data** to load the report."
+            "Pick a **Date Range** on the left, then click **Fetch Data**. "
+            "Vendor / Category / Company filters unlock once data is loaded, "
+            "and won't need another database query."
         )
 
 
@@ -1906,11 +1920,7 @@ def render_drillthrough(qp):
 
     try:
         conn_str = build_connection_string(
-            SQL_ENDPOINT,
-            DATABASE,
-            CLIENT_ID,
-            CLIENT_SECRET,
-            TENANT_ID,
+            SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID,
         )
     except Exception as e:
         st.error(str(e))
@@ -1919,12 +1929,7 @@ def render_drillthrough(qp):
     if drill_type == "available":
         title = "📦 Available Inventory"
         subtitle = "Current inventory for the selected Vendor / Category / Company."
-
-        params = [
-            company,  company,
-            vendor,   vendor,
-            category, category,
-        ]
+        params = [company, company, vendor, vendor, category, category]
         sql = AVAILABLE_SQL
     else:
         title = "🛍️ Sold Products"
@@ -1932,13 +1937,9 @@ def render_drillthrough(qp):
             f"Products sold between {start_date:%d-%b-%Y} and "
             f"{end_date:%d-%b-%Y}."
         )
-
         params = [
-            start_date.isoformat(),
-            end_date.isoformat(),
-            company,  company,
-            vendor,   vendor,
-            category, category,
+            start_date.isoformat(), end_date.isoformat(),
+            company, company, vendor, vendor, category, category,
         ]
         sql = SALES_SQL
 
@@ -1970,7 +1971,6 @@ def render_drillthrough(qp):
     if drill_type == "sales":
         total_qty = df["sale_qty"].sum() if not df.empty else 0
         total_value = df["sale_value"].sum() if not df.empty else 0
-
         st.markdown(
             '<div class="summary-box">'
             f'<strong>Sales drill-through:</strong> '
@@ -1982,12 +1982,7 @@ def render_drillthrough(qp):
         )
     else:
         total_qty = df["available_inventory"].sum() if not df.empty else 0
-        total_value = (
-            df["available_selling_price"].sum()
-            if not df.empty
-            else 0
-        )
-
+        total_value = df["available_selling_price"].sum() if not df.empty else 0
         st.markdown(
             '<div class="summary-box">'
             f'<strong>Inventory drill-through:</strong> '
@@ -2000,7 +1995,6 @@ def render_drillthrough(qp):
 
     if df.empty:
         st.warning("No products were found for this drill-through selection.")
-
         with st.expander("🔍 Debug information", expanded=True):
             st.write("**Drill type:**", drill_type)
             st.write("**Company:**", repr(company))
@@ -2014,35 +2008,14 @@ def render_drillthrough(qp):
                 "malformed parameter was sent. If the values look correct, "
                 "the underlying table has no rows for this combination."
             )
-
         st.stop()
-    #Fix here for image drill through
+
     # ---------------------------------------------------------------
     # Resolve abfss:// images server-side via the Azure SDK.
     # Adds a '_image_data_uri' column with data:image/...;base64,... URIs.
     # ---------------------------------------------------------------
     with st.spinner("Loading images..."):
         df = resolve_images_for_df(df)
-
-    #     st.subheader("Debug - Before Image Resolution")
-
-    # st.write(
-    #     df[["product_id", "image_1920"]].head(10)
-    # )
-
-    # with st.spinner("Loading images..."):
-    #     df = resolve_images_for_df(df)
-
-    # st.subheader("Debug - After Image Resolution")
-
-    # st.write(
-    #     df[["product_id", "image_1920", "_image_data_uri"]].head(10)
-    # )
-
-    # st.write(
-    #     "Resolved Images:",
-    #     df["_image_data_uri"].notna().sum()
-    # )
 
     CARDS_PER_ROW = 4
 
@@ -2053,15 +2026,9 @@ def render_drillthrough(qp):
         for col, (_, row) in zip(cols, chunk.iterrows()):
             with col:
                 if drill_type == "available":
-                    st.markdown(
-                        render_available_card(row),
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown(render_available_card(row), unsafe_allow_html=True)
                 else:
-                    st.markdown(
-                        render_sales_card(row),
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown(render_sales_card(row), unsafe_allow_html=True)
 
     st.caption(f"Showing {len(df):,} product rows.")
 
