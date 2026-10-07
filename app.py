@@ -59,10 +59,14 @@ Pillow.
 """
 
 import base64
+import hashlib
 import io
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from report_logic import (DATE_PRESETS, METRICS, date_bounds, read_category_mapping,
+    add_master_category, aggregate_report, consolidate_products, scope_predicate)
 from urllib.parse import urlencode, urlparse
 
 import pandas as pd
@@ -149,60 +153,6 @@ st.markdown(
         --stock-bg: #12351f;
         --stock-fg: #9fe1b2;
         --border: #eadbc6;
-    }
-
-    @media (prefers-color-scheme: dark) {
-        :root {
-            --st-bg: #14100e;
-            --st-bg2: #1c1815;
-            --st-text: #f3e8d9;
-            --muted: rgba(243,232,217,.65);
-            --gold: #d8b34c;
-            --on-accent: #2b0a1c;
-            --accent-chip: #b66289;
-            --wine: #b66289;
-            --wine2: #cf6a91;
-            --card-border: #3a2f2a;
-            --card-bg: #1d1f21;
-            --card-shadow: rgba(0,0,0,.4);
-            --sidebar-border: #3a2f2a;
-            --select-border: #4a3a30;
-            --pill-border: #3a2f2a;
-            --notice-bg-1: #2b1e13;
-            --notice-bg-2: #2a2415;
-            --notice-border: #8a6a1f;
-            --notice-title: #f0c060;
-            --notice-text: #f3e8d9;
-            --stock-bg: #12351f;
-            --stock-fg: #9fe1b2;
-            --border: #3a2f2a;
-        }
-    }
-
-    [data-theme="dark"] {
-        --st-bg: #14100e;
-        --st-bg2: #1c1815;
-        --st-text: #f3e8d9;
-        --muted: rgba(243,232,217,.65);
-        --gold: #d8b34c;
-        --on-accent: #2b0a1c;
-        --accent-chip: #b66289;
-        --wine: #b66289;
-        --wine2: #cf6a91;
-        --card-border: #3a2f2a;
-        --card-bg: #1d1f21;
-        --card-shadow: rgba(0,0,0,.4);
-        --sidebar-border: #3a2f2a;
-        --select-border: #4a3a30;
-        --pill-border: #3a2f2a;
-        --notice-bg-1: #2b1e13;
-        --notice-bg-2: #2a2415;
-        --notice-border: #8a6a1f;
-        --notice-title: #f0c060;
-        --notice-text: #f3e8d9;
-        --stock-bg: #12351f;
-        --stock-fg: #9fe1b2;
-        --border: #3a2f2a;
     }
 
     html, body, .stApp {
@@ -1148,6 +1098,8 @@ SALES_SQL = PRODUCT_BASE + """
 pos_sales AS (
     SELECT
         po.company_id_name AS company,
+        CAST(po.id AS VARCHAR(50)) AS order_id,
+        CAST(po.date_order AS DATE) AS sold_date,
         CAST(po.picking_ids AS VARCHAR(MAX)) AS picking_ids,
         CAST(pol.product_id AS VARCHAR(50)) AS product_id,
         SUM(pol.qty) AS sale_qty,
@@ -1173,6 +1125,8 @@ pos_sales AS (
     )
     GROUP BY
         po.company_id_name,
+        CAST(po.id AS VARCHAR(50)),
+        CAST(po.date_order AS DATE),
         CAST(po.picking_ids AS VARCHAR(MAX)),
         CAST(pol.product_id AS VARCHAR(50))
 ),
@@ -1181,6 +1135,7 @@ lot_moves AS (
         CAST(pk.id AS VARCHAR(50)) AS picking_id,
         CAST(sml.product_id AS VARCHAR(50)) AS product_id,
         NULLIF(sml.lot_id_name, 'False') AS lot_number,
+        sml.location_id_name AS location,
         SUM(ABS(COALESCE(sml.quantity_product_uom, sml.quantity, 0))) AS lot_qty
     FROM WT_LH_Silver.Odoo.stock_picking pk
     INNER JOIN WT_LH_Silver.Odoo.stock_move_line sml
@@ -1192,24 +1147,29 @@ lot_moves AS (
     GROUP BY
         CAST(pk.id AS VARCHAR(50)),
         CAST(sml.product_id AS VARCHAR(50)),
-        NULLIF(sml.lot_id_name, 'False')
+        NULLIF(sml.lot_id_name, 'False'),
+        sml.location_id_name
 ),
-sales_detail AS (
-    SELECT
-        ps.company,
-        ps.product_id,
-        COALESCE(lm.lot_number, 'No lot recorded') AS lot_number,
-        COALESCE(lm.lot_qty, ps.sale_qty) AS sale_qty,
-        CASE
-            WHEN lm.lot_qty IS NULL THEN ps.sale_value
-            WHEN ps.sale_qty <> 0 THEN ps.sale_value * lm.lot_qty / ps.sale_qty
-            ELSE 0
-        END AS sale_value
+sales_lot_matches AS (
+    SELECT ps.*,
+        lm.lot_number, lm.location, lm.lot_qty,
+        SUM(lm.lot_qty) OVER (PARTITION BY ps.order_id, ps.product_id) AS matched_qty,
+        COUNT(*) OVER (PARTITION BY ps.order_id, ps.product_id) AS matched_rows
     FROM pos_sales ps
     LEFT JOIN lot_moves lm
         ON (',' + REPLACE(REPLACE(REPLACE(ps.picking_ids, '[', ''), ']', ''), ' ', '') + ',')
            LIKE '%,' + lm.picking_id + ',%'
        AND lm.product_id = ps.product_id
+),
+sales_detail AS (
+    SELECT company, product_id, sold_date,
+        COALESCE(lot_number, 'No lot recorded') AS lot_number,
+        COALESCE(location, 'No location recorded') AS location,
+        sale_qty * CASE WHEN matched_qty > 0 THEN 1.0 * lot_qty / matched_qty
+                        ELSE 1.0 / matched_rows END AS sale_qty,
+        sale_value * CASE WHEN matched_qty > 0 THEN 1.0 * lot_qty / matched_qty
+                          ELSE 1.0 / matched_rows END AS sale_value
+    FROM sales_lot_matches
 )
 SELECT
     s.company,
@@ -1221,6 +1181,8 @@ SELECT
     p.sp,
     p.cp,
     s.lot_number,
+    s.location,
+    s.sold_date,
     s.sale_qty,
     s.sale_value,
     COALESCE(pi.image_1920, '') AS image_1920
@@ -1414,6 +1376,8 @@ def render_available_card(row):
         '<div class="product-subtitle">'
         f'{safe_html(row.get("category", ""))}<br>{safe_html(row.get("vendor", ""))}'
         '</div>',
+        _detail_row("Master category", safe_html(row.get("master_category", ""))),
+        _detail_row("Store", safe_html(row.get("company", ""))),
         _detail_row("SKU", safe_html(row.get("sku", ""))),
         _detail_row("Lot No.", safe_html(row.get("lot_number", ""))),
         _detail_row("Location", safe_html(row.get("location", ""))),
@@ -1444,8 +1408,13 @@ def render_sales_card(row):
         '<div class="product-subtitle">'
         f'{safe_html(row.get("category", ""))}<br>{safe_html(row.get("vendor", ""))}'
         '</div>',
+        _detail_row("Master category", safe_html(row.get("master_category", ""))),
+        _detail_row("Store", safe_html(row.get("company", ""))),
         _detail_row("SKU", safe_html(row.get("sku", ""))),
         _detail_row("Lot No.", safe_html(row.get("lot_number", ""))),
+        _detail_row("Location", safe_html(row.get("location", ""))),
+        _detail_row("Latest sold date", safe_html(row.get("sold_date", ""))),
+        _detail_row("Days since sale", safe_html(row.get("sale_age", ""))),
         _detail_row("Sold Qty", f"{sale_qty:g}"),
         _detail_row("Sale value", f"₹{sale_value:,.0f}"),
         '<div class="price-row">'
@@ -1485,7 +1454,9 @@ def resolve_images_for_df(df: pd.DataFrame) -> pd.DataFrame:
     if can_fetch:
         try:
             client = get_datalake_service_client()
-            results = load_images_parallel(client, refs)
+            unique_refs = list(dict.fromkeys(r for r in refs if r.startswith("abfss://")))
+            fetched = dict(zip(unique_refs, load_images_parallel(client, unique_refs)))
+            results = [fetched.get(ref, (None, None, None)) for ref in refs]
         except Exception as e:
             # Do not kill the page - just fall back to "No image available".
             st.warning(f"Image client init failed: {type(e).__name__}: {e}")
@@ -1514,539 +1485,454 @@ def _reset_page():
     st.session_state["page"] = 1
 
 
-def render_main_report():
-    st.markdown(
-        '<div class="hero">'
-        '<h1>📊 Vendor / Category Sales, Inward &amp; Inventory Report</h1>'
-        '<p>Live data from the Fabric Lakehouse — filtered by the panel on the left.</p>'
-        '<div class="rule"></div>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+@st.cache_data(show_spinner=False)
+def _mapping_for_file(filename, modified):
+    return read_category_mapping(filename)
 
-    # If we arrived here via "← Back to Report" from a drill-through page,
-    # the previously applied filters were carried in the URL (r_start,
-    # r_end, r_companies, ...). Read them so we can pre-fill the widgets
-    # and re-run the same report automatically, instead of showing the
-    # empty "click Fetch Data" state.
-    qp = st.query_params
-    restore_start_str = qp.get("r_start", "")
-    restore_end_str = qp.get("r_end", "")
-    restore_companies = _decode_list(qp.get("r_companies", ""))
-    restore_vendors = _decode_list(qp.get("r_vendors", ""))
-    restore_categories = _decode_list(qp.get("r_categories", ""))
-    has_restore_state = bool(restore_start_str and restore_end_str)
 
+def load_master_mapping():
+    filename = Path(__file__).with_name("PRASHANTI-ODOO CATEGORY.xlsx")
     try:
-        default_start_date = (
-            date.fromisoformat(restore_start_str) if restore_start_str else date(2026, 8, 1)
-        )
-    except Exception:
-        default_start_date = date(2026, 8, 1)
+        return _mapping_for_file(str(filename), filename.stat().st_mtime_ns)
+    except (OSError, ValueError, KeyError) as error:
+        st.error(f"Category mapping could not be loaded: {error}")
+        st.stop()
 
-    try:
-        default_end_date = (
-            date.fromisoformat(restore_end_str) if restore_end_str else date(2026, 8, 9)
-        )
-    except Exception:
-        default_end_date = date(2026, 8, 9)
 
-    # -----------------------------------------------------------------
-    # STAGE 1 — Date range + Fetch Data. This is the ONLY thing that can
-    # trigger a SQL round trip. Everything else below (Vendor/Category/
-    # Company) filters the in-memory result once it's loaded.
-    # -----------------------------------------------------------------
-    st.sidebar.markdown("## 🔎 Report")
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**📅 Date Range**")
-    start_date = st.sidebar.date_input("Start Date", value=default_start_date)
-    end_date = st.sidebar.date_input("End Date", value=default_end_date)
+def business_today():
+    return datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
-    run_clicked = st.sidebar.button(
-        "▶️  Fetch Data",
-        type="primary",
-        use_container_width=True,
-    )
 
-    col_a, col_b = st.sidebar.columns(2)
-    with col_a:
-        if st.button("↻ Refetch range", use_container_width=True):
-            # Force-bypass the 6h cache for this exact date range.
-            get_aggregate_data.clear()
-            run_query.clear()
-            run_clicked = True
-    with col_b:
-        if st.button("🗑️ Clear all cache", use_container_width=True):
-            run_query.clear()
-            get_connection.clear()
-            get_aggregate_data.clear()
-            load_image_cached.clear()
-            st.session_state.pop("raw_df", None)
-            st.session_state.pop("raw_meta", None)
-            st.sidebar.info("Cache cleared.")
+def appearance_controls(qp):
+    with st.sidebar.expander("Display settings"):
+        default = int(qp.get("r_header_size", "16")) if str(qp.get("r_header_size", "16")).isdigit() else 16
+        size = st.slider("Table and card header size", 12, 24, max(12, min(24, default)), key="header_size")
+    st.html(f"<style>.report-table th {{font-size:{size}px;}} .product-title {{font-size:{size}px;}} "
+            ".hero h1,.drill-hero h1 {font-size:28px;} "
+            ".report-table.has-category {table-layout:fixed;} "
+            ".report-table .pin-category {position:sticky;left:0;z-index:2;width:260px;box-sizing:border-box;} "
+            ".report-table .pin-vendor {position:sticky;left:260px;z-index:2;width:180px;box-sizing:border-box;} "
+            ".report-table th {white-space:normal;overflow-wrap:anywhere;} "
+            ".report-table td {overflow:hidden;text-overflow:ellipsis;} "
+            ".report-table td.dimension-cell {white-space:normal;overflow-wrap:anywhere;vertical-align:top;} "
+            ".report-table td.pin-category,.report-table td.pin-vendor {background:var(--st-bg2);} "
+            ".report-table th.pin-category,.report-table th.pin-vendor {background:#560835;z-index:3;} "
+            ".report-table th {position:sticky;top:0;} </style>")
 
-    if "page" not in st.session_state:
-        st.session_state["page"] = 1
-    if "page_size" not in st.session_state:
-        st.session_state["page_size"] = 25
 
-    # Auto-restore: this is a fresh session (e.g. we just navigated back
-    # from a drill-through page) and the URL says a report was already
-    # applied - re-run it automatically instead of waiting for another
-    # "Fetch Data" click.
-    auto_restore = (
-        not run_clicked
-        and "raw_df" not in st.session_state
-        and has_restore_state
-        and connection_is_configured()
-    )
+def options(df, column, null_label=None):
+    values = sorted(df[column].dropna().astype(str).unique().tolist())
+    if null_label is not None and df[column].isna().any():
+        values.insert(0, null_label)
+    return values
 
-    if not connection_is_configured():
-        st.sidebar.warning(
-            "Connection details aren't configured. Add SQL_ENDPOINT, DATABASE, "
-            "TENANT_ID, CLIENT_ID and CLIENT_SECRET to Streamlit secrets."
-        )
 
-    if run_clicked or auto_restore:
-        if start_date > end_date:
-            st.error("Start Date must be on or before End Date.")
-        elif not connection_is_configured():
-            st.error("Connection details aren't configured.")
+def select_filter(label, values, key, defaults=()):
+    if key not in st.session_state:
+        st.session_state[key] = [value for value in defaults if value in values]
+    else:
+        st.session_state[key] = [value for value in st.session_state[key] if value in values]
+    return st.sidebar.multiselect(label, values, key=key)
+
+
+def selected_mask(df, column, values, null_label=None):
+    if not values:
+        return pd.Series(True, index=df.index)
+    mask = df[column].isin([v for v in values if v != null_label])
+    if null_label is not None and null_label in values:
+        mask |= df[column].isna()
+    return mask
+
+
+def scope_values(df, column, null_label):
+    return sorted(set(df[column].fillna(null_label).astype(str)))
+
+
+def scoped_drill_url(kind, df, meta, state):
+    params = dict(state)
+    params.update({"drill": kind, "scope": "group", "start_date": meta["start_date"].isoformat(),
+                   "end_date": meta["end_date"].isoformat(),
+                   "d_companies": _encode_list(scope_values(df, "company_id_name", "(No store)")),
+                   "d_vendors": _encode_list(scope_values(df, "Vendor", NONE_VENDOR_LABEL)),
+                   "d_categories": _encode_list(scope_values(df, "categ_id_name", "(No category)"))})
+    return "?" + urlencode(params)
+
+
+def render_group_table(frame, keys, meta, state, sort_field, ascending):
+    grouped = aggregate_report(frame, keys)
+    grouped = grouped.sort_values([sort_field] + [key for key in keys if key != sort_field],
+                                 ascending=[ascending] + [True for key in keys if key != sort_field],
+                                 na_position="last", kind="stable")
+    headers = [{"categ_id_name": "Category", "Vendor": "Vendor", "company_id_name": "Store", "master_category": "Master category"}[key] for key in keys]
+    headers += ["Sold qty", "Sales value", "Available qty", "Available value", "Inward qty", "Inward value"]
+    table_class = "report-table has-category" if "categ_id_name" in keys else "report-table"
+    dimension_widths = {"categ_id_name": 260, "Vendor": 180, "master_category": 180, "company_id_name": 300}
+    widths = [dimension_widths[key] for key in keys] + [125, 160, 125, 160, 125, 160]
+    table_width = sum(widths)
+    html = [f'<div class="report-table-wrap"><table class="{table_class}" style="width:{table_width}px;min-width:{table_width}px"><colgroup>']
+    html.extend(f'<col style="width:{width}px">' for width in widths)
+    html.append("</colgroup><thead><tr>")
+    classes = ["dimension-cell " + ("pin-category" if key == "categ_id_name" else "pin-vendor" if key == "Vendor" and "categ_id_name" in keys else "") for key in keys]
+    html.extend(f'<th class="{classes[i] if i < len(classes) else ""}">{safe_html(label)}</th>' for i, label in enumerate(headers))
+    html.append("</tr></thead><tbody>")
+    def add_row(labels, totals, scope):
+        html.append("<tr>" + "".join(f'<td class="{classes[i]}" title="{safe_html(label)}">{safe_html(label)}</td>' for i, label in enumerate(labels)))
+        for metric in METRICS:
+            value = float(totals[metric])
+            if metric in {"sale_qty", "available_qty"}:
+                kind = "sales" if metric == "sale_qty" else "available"
+                url = scoped_drill_url(kind, scope, meta, state)
+                html.append(f'<td><a class="qty-link" href="{safe_html(url)}" target="_self">{value:,.2f}</a></td>')
+            elif metric.endswith("value"):
+                html.append(f"<td>₹{value:,.2f}</td>")
+            else:
+                html.append(f"<td>{value:,.2f}</td>")
+        html.append("</tr>")
+    for _, row in grouped.iterrows():
+        mask = pd.Series(True, index=frame.index)
+        for key in keys:
+            mask &= frame[key].isna() if pd.isna(row[key]) else frame[key].eq(row[key])
+        add_row([row[key] if pd.notna(row[key]) else "(Not recorded)" for key in keys], row, frame[mask])
+    if not frame.empty:
+        add_row(["Total"] + [""] * (len(keys) - 1), frame[METRICS].sum(), frame)
+    html.append("</tbody></table></div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+    return grouped
+
+
+def render_hierarchy_table(frame, meta, state, sort_field, ascending):
+    """Expand master/category rows in the same HTML table, without a rerun."""
+    headers = ["Master category / Category / Vendor", "Sold qty", "Sales value",
+               "Available qty", "Available value", "Inward qty", "Inward value"]
+    style = ["""
+        .pivot-hierarchy .category-row,.pivot-hierarchy .vendor-row {display:none;}
+        .pivot-hierarchy tbody:has(.master-toggle[open]) .category-row {display:table-row;}
+        .pivot-hierarchy .tree-cell {min-width:320px;}
+        .pivot-hierarchy .category-row .tree-cell {padding-left:32px;}
+        .pivot-hierarchy .vendor-row .tree-cell {padding-left:60px;}
+        .pivot-hierarchy summary {cursor:pointer;white-space:normal;}
+        .pivot-hierarchy summary:focus-visible {outline:2px solid #b6871f;outline-offset:3px;}
+        .pivot-hierarchy .master-row,.pivot-hierarchy .grand-total {font-weight:700;}
+        .pivot-hierarchy .master-row td {background:var(--st-bg2);}
+        .pivot-hierarchy .grand-total td {border-top:2px solid #b6871f;}
+    """]
+    markup = ['<div class="report-table-wrap"><table class="report-table pivot-hierarchy"><thead><tr>']
+    markup.extend(f"<th>{safe_html(header)}</th>" for header in headers)
+    markup.append("</tr></thead>")
+
+    def ordered(group, key):
+        rows = aggregate_report(group, [key])
+        primary = sort_field if sort_field in METRICS else key
+        fields = [primary] + ([key] if primary != key else [])
+        return rows.sort_values(fields, ascending=[ascending] + ([True] if primary != key else []),
+                                na_position="last", kind="stable")
+
+    def row(label, totals, scope, row_class, toggle_id=None, toggle_class=""):
+        markup.append(f'<tr class="{row_class}"><td class="tree-cell">')
+        if toggle_id:
+            markup.append(f'<details id="{toggle_id}" class="{toggle_class}"><summary>{safe_html(label)}</summary></details>')
         else:
-            conn_str = build_connection_string(
-                SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID,
-            )
-            t0 = time.time()
-            with st.spinner("Running query against the Lakehouse..."):
-                try:
-                    raw_df = get_aggregate_data(
-                        conn_str, start_date.isoformat(), end_date.isoformat()
-                    )
-                    st.session_state["raw_df"] = raw_df
-                    st.session_state["raw_meta"] = {
-                        "start_date": start_date,
-                        "end_date": end_date,
-                        "elapsed": time.time() - t0,
-                        "fetched_at": datetime.now(),
-                    }
-                    _reset_page()
-                    # A brand-new fetch means any previously selected
-                    # filters may no longer apply - reseed from restore
-                    # state (or clear) so stale selections don't hide data.
-                    # The company widget's key stores DISPLAY names, so
-                    # translate restore_companies (full names) through the
-                    # same display-map logic used to render the widget.
-                    company_opts_now, _, _ = derive_filter_options(raw_df)
-                    company_display_map_now = {
-                        c: c.split(" - ", 1)[-1] if " - " in c else c
-                        for c in company_opts_now
-                    }
-                    if auto_restore:
-                        st.session_state["flt_vendor"] = list(restore_vendors)
-                        st.session_state["flt_category"] = list(restore_categories)
-                        st.session_state["flt_company_display"] = [
-                            company_display_map_now[c]
-                            for c in restore_companies
-                            if c in company_display_map_now
-                        ]
-                    else:
-                        st.session_state["flt_vendor"] = []
-                        st.session_state["flt_category"] = []
-                        st.session_state["flt_company_display"] = []
-                except Exception as e:
-                    st.error(f"Query failed: {e}")
+            markup.append(safe_html(label))
+        markup.append("</td>")
+        for metric in METRICS:
+            value = float(totals[metric])
+            if metric in {"sale_qty", "available_qty"}:
+                kind = "sales" if metric == "sale_qty" else "available"
+                url = scoped_drill_url(kind, scope, meta, state)
+                markup.append(f'<td><a class="qty-link" href="{safe_html(url)}" target="_self">{value:,.2f}</a></td>')
+            else:
+                prefix = "₹" if metric.endswith("value") else ""
+                markup.append(f"<td>{prefix}{value:,.2f}</td>")
+        markup.append("</tr>")
 
-    raw_df = st.session_state.get("raw_df")
-    raw_meta = st.session_state.get("raw_meta")
+    for master_index, (_, master_row) in enumerate(ordered(frame, "master_category").iterrows()):
+        master = master_row.master_category
+        group = frame[frame.master_category.eq(master)]
+        master_id = f"pivot-master-{master_index}"
+        markup.append("<tbody>")
+        row(master, master_row, group, "master-row", master_id, "master-toggle")
+        for category_index, (_, category_row) in enumerate(ordered(group, "categ_id_name").iterrows()):
+            category = category_row.categ_id_name
+            category_group = group[group.categ_id_name.eq(category)]
+            category_id = f"pivot-category-{master_index}-{category_index}"
+            vendor_class = f"pivot-vendors-{master_index}-{category_index}"
+            style.append(f".pivot-hierarchy tbody:has(#{master_id}[open]):has(#{category_id}[open]) .{vendor_class} {{display:table-row;}}")
+            row(category, category_row, category_group, "category-row", category_id, "category-toggle")
+            for _, vendor_row in ordered(category_group, "Vendor").iterrows():
+                vendor = vendor_row.Vendor
+                vendor_group = category_group[category_group.Vendor.isna() if pd.isna(vendor) else category_group.Vendor.eq(vendor)]
+                row("(No vendor)" if pd.isna(vendor) else vendor, vendor_row, vendor_group,
+                    f"vendor-row {vendor_class}")
+        markup.append("</tbody>")
+    markup.append("<tbody>")
+    row("Grand total", frame[METRICS].sum(), frame, "grand-total")
+    markup.append("</tbody></table></div>")
+    st.html("<style>" + "".join(style) + "</style>")
+    st.markdown("".join(markup), unsafe_allow_html=True)
 
-    # -----------------------------------------------------------------
-    # STAGE 2 — Vendor / Category / Company filters, computed purely
-    # from the already-fetched DataFrame. Selecting these never touches
-    # SQL Server again; it's a pandas .isin() on data already in memory.
-    # -----------------------------------------------------------------
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("## 🧰 Refine (instant, no re-query)")
 
-    if raw_df is None:
-        st.sidebar.caption("Fetch a date range first to unlock these filters.")
-        company_options, vendor_options, category_options = [], [], []
+def render_main_report():
+    qp = st.query_params
+    mapping = load_master_mapping()
+    appearance_controls(qp)
+    st.title("Sales, inward and inventory")
+    st.caption("Master category → Category → Vendor · totals across selected stores")
+    today = business_today()
+    try:
+        initial = (date.fromisoformat(qp["r_start"]), date.fromisoformat(qp["r_end"])) if qp.get("r_start") and qp.get("r_end") else date_bounds("Month to date", today)
+    except ValueError:
+        initial = date_bounds("Month to date", today)
+    if "applied_dates" not in st.session_state:
+        st.session_state.applied_dates = initial
+    if "date_preset" not in st.session_state:
+        st.session_state.date_preset = "Custom range" if qp.get("r_start") else "Month to date"
+    def reset_date_draft():
+        st.session_state.pop("custom_dates", None)
+    def cancel_dates():
+        reset_date_draft()
+        st.session_state.date_preset = "Custom range"
+    with st.popover("Date range", icon=":material/calendar_month:"):
+        preset = st.selectbox("Period", DATE_PRESETS, key="date_preset", on_change=reset_date_draft)
+        if preset == "Custom range":
+            pending = st.date_input("Start and end dates", value=st.session_state.applied_dates,
+                                    max_value=today, key="custom_dates", format="DD/MM/YYYY")
+        else:
+            pending = date_bounds(preset, today)
+            st.caption(f"{pending[0]:%d %b %Y} – {pending[1]:%d %b %Y}")
+        apply = st.button("Apply", type="primary", disabled=len(pending) != 2)
+        st.button("Cancel", on_click=cancel_dates)
+    start_date, end_date = st.session_state.applied_dates
+    if apply and len(pending) == 2:
+        start_date, end_date = pending
+    run_clicked = apply or st.sidebar.button("Fetch data", type="primary")
+    refresh = st.sidebar.button("Refresh applied range")
+    if refresh:
+        get_aggregate_data.clear()
+        run_query.clear()
+        run_clicked = True
+    clear_clicked = st.sidebar.button("Clear data and image cache")
+    if clear_clicked:
+        get_aggregate_data.clear()
+        run_query.clear()
+        load_image_cached.clear()
+        get_connection.clear()
+        st.session_state.pop("raw_df", None)
+        st.session_state.pop("raw_meta", None)
+        st.sidebar.success("Cache cleared. Fetch data to reload.")
+    auto_restore = not clear_clicked and "raw_df" not in st.session_state and bool(qp.get("r_start"))
+    if (run_clicked or auto_restore) and connection_is_configured():
+        with st.spinner("Loading report..."):
+            try:
+                conn_str = build_connection_string(SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID)
+                t0 = time.time()
+                raw = get_aggregate_data(conn_str, start_date.isoformat(), end_date.isoformat())
+                st.session_state.raw_df = raw
+                st.session_state.raw_meta = dict(start_date=start_date, end_date=end_date,
+                                                fetched_at=datetime.now(), elapsed=time.time() - t0)
+                st.session_state.applied_dates = (start_date, end_date)
+            except Exception as error:
+                st.error(f"Report query failed: {error}")
+    elif not connection_is_configured():
+        st.info("Configure the SQL connection secrets to fetch report data.")
+    raw = st.session_state.get("raw_df")
+    if raw is None:
+        st.info("Choose a date range and click Apply or Fetch data.")
+        return
+    meta = st.session_state.raw_meta
+    st.caption(f"Applied period: {meta['start_date']:%d %b %Y} – {meta['end_date']:%d %b %Y} · Asia/Kolkata · week starts Monday")
+    raw = add_master_category(raw, mapping, "categ_id_name")
+    st.sidebar.subheader("Report filters")
+    companies = select_filter("Store (company)", options(raw, "company_id_name", "(No store)"), "report_stores", _decode_list(qp.get("r_companies", "")))
+    vendors = select_filter("Vendor", options(raw, "Vendor", NONE_VENDOR_LABEL), "report_vendors", _decode_list(qp.get("r_vendors", "")))
+    masters = select_filter("Master category", options(raw, "master_category"), "report_masters", _decode_list(qp.get("r_masters", "")))
+    category_source = raw[raw.master_category.isin(masters)] if masters else raw
+    categories = select_filter("Category", options(category_source, "categ_id_name"), "report_categories", _decode_list(qp.get("r_categories", "")))
+    mask = selected_mask(raw, "company_id_name", companies, "(No store)") & selected_mask(raw, "Vendor", vendors, NONE_VENDOR_LABEL) & selected_mask(raw, "master_category", masters) & selected_mask(raw, "categ_id_name", categories)
+    df = raw[mask]
+    state = build_report_state_params(meta["start_date"], meta["end_date"], companies, vendors, categories)
+    state.update(r_masters=_encode_list(masters), r_header_size=str(st.session_state.header_size))
+    view_options = ["Category hierarchy", "Store pivot", "Detailed rows"]
+    if "report_view" not in st.session_state:
+        st.session_state.report_view = qp.get("r_view", view_options[0]) if qp.get("r_view") in view_options else view_options[0]
+    view = st.segmented_control("Report view", view_options, key="report_view") or view_options[0]
+    state["r_view"] = view
+    labels = {"categ_id_name": "Category", "Vendor": "Vendor", "sale_qty": "Sold quantity", "sale_value": "Sales value", "available_qty": "Available quantity", "available_value": "Available value", "inward_qty": "Inward quantity", "inward_value": "Inward value"}
+    if "report_sort" not in st.session_state:
+        st.session_state.report_sort = qp.get("r_sort", "categ_id_name") if qp.get("r_sort") in labels else "categ_id_name"
+    if "report_direction" not in st.session_state:
+        st.session_state.report_direction = qp.get("r_direction", "Ascending") if qp.get("r_direction") in {"Ascending", "Descending"} else "Ascending"
+    controls = st.columns([3, 1])
+    with controls[0]:
+        sort_field = st.selectbox("Sort by", list(labels), format_func=labels.get, key="report_sort")
+    with controls[1]:
+        ascending = st.selectbox("Direction", ["Ascending", "Descending"], key="report_direction") == "Ascending"
+    state.update(r_sort=sort_field, r_direction=st.session_state.report_direction)
+    metrics = st.columns(4)
+    for container, metric, label in zip(metrics, ["sale_value", "available_value", "inward_value", "sale_qty"], ["Sales value", "Available value", "Inward value", "Sold quantity"]):
+        container.metric(label, f"₹{df[metric].sum():,.2f}" if metric.endswith("value") else f"{df[metric].sum():,.2f}")
+    st.caption("Sales and inward use the applied period. Available stock is the current snapshot. Click sold or available quantities to open the separate product page.")
+    unmapped = options(raw[raw.master_category.eq("Unmapped")], "categ_id_name")
+    if unmapped:
+        with st.expander(f"Unmapped categories ({len(unmapped)})"):
+            st.write(unmapped)
+    if df.empty:
+        st.info("No rows match these filters.")
+        return
+    if view == "Category hierarchy":
+        st.caption("Use the arrow inside a master-category row to expand categories, then expand a category for vendors. Totals sum all selected stores.")
+        render_hierarchy_table(df, meta, state, sort_field, ascending)
+    elif view == "Store pivot":
+        metric = st.selectbox("Pivot measure", METRICS, format_func=lambda v: labels[v])
+        pivot = df.groupby(["master_category", "categ_id_name", "company_id_name"], dropna=False)[metric].sum().unstack("company_id_name", fill_value=0)
+        pivot["Total"] = pivot.sum(axis=1)
+        pivot = pivot.sort_values("Total", ascending=ascending) if sort_field in METRICS else pivot.sort_index(ascending=ascending)
+        st.dataframe(pivot, width="stretch")
+        st.caption(f"Grand total: {df[metric].sum():,.2f}. Use the category totals below for drill-through.")
+        render_group_table(df, ["categ_id_name"], meta, state, sort_field if sort_field != "Vendor" else "categ_id_name", ascending)
+        st.download_button("Download pivot CSV", pivot.to_csv().encode("utf-8-sig"), "store_pivot.csv", "text/csv")
     else:
-        company_options, vendor_options, category_options = derive_filter_options(raw_df)
-
-        company_display_map = {
-            c: c.split(" - ", 1)[-1] if " - " in c else c
-            for c in company_options
-        }
-
-        st.sidebar.markdown("**🏢 Company**")
-        # No `default=` here on purpose: the widget's initial value comes
-        # from st.session_state["flt_company_display"] if it was already
-        # seeded (see the restore/reset logic in the fetch block above).
-        # This is the supported pattern for pre-setting a keyed widget's
-        # value without Streamlit's "set both via session_state and via
-        # default" conflict.
-        selected_display = st.sidebar.multiselect(
-            "Company",
-            options=list(company_display_map.values()),
-            key="flt_company_display",
-            label_visibility="collapsed",
-            on_change=_reset_page,
-        )
-        selected_companies = [
-            company
-            for company, display in company_display_map.items()
-            if display in selected_display
-        ]
-
-        st.sidebar.markdown("**🏷️ Vendor**")
-        selected_vendors = st.sidebar.multiselect(
-            "Vendor",
-            options=vendor_options,
-            key="flt_vendor",
-            label_visibility="collapsed",
-            on_change=_reset_page,
-        )
-
-        st.sidebar.markdown("**📦 Category**")
-        selected_categories = st.sidebar.multiselect(
-            "Category",
-            options=category_options,
-            key="flt_category",
-            label_visibility="collapsed",
-            on_change=_reset_page,
-        )
-
-    if raw_df is not None:
-        df = filter_report_df(raw_df, selected_vendors, selected_categories, selected_companies)
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Rows", f"{len(df):,}")
-        k2.metric("Sale Value", f"₹{df['sale_value'].sum():,.0f}")
-        k3.metric("Inward Value", f"₹{df['inward_value'].sum():,.0f}")
-        k4.metric("Available Value", f"₹{df['available_value'].sum():,.0f}")
-
-        age_seconds = (datetime.now() - raw_meta["fetched_at"]).total_seconds()
-        age_minutes = int(age_seconds // 60)
-        remaining_hours = max(0, (AGGREGATE_CACHE_TTL_SECONDS - age_seconds) / 3600)
-        st.markdown(
-            f'<div class="cache-badge">🕒 Fetched in {raw_meta["elapsed"]:.2f}s · '
-            f'in memory for {age_minutes} min · '
-            f'valid ~{remaining_hours:.1f}h more before a re-fetch is needed</div>',
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            '<div class="notice-card">'
-            '<div class="notice-icon">📦</div>'
-            '<div>'
-            '<div class="notice-title">Inventory Snapshot Notice</div>'
-            '<div class="notice-body">'
-            '<b>Quantity</b> and <b>stock value</b> figures reflect '
-            '<b>current inventory on hand</b> — they are <u>not</u> '
-            'scoped to the selected date range. Only Sales and '
-            'Inward figures are filtered by date. Vendor / Category / '
-            'Company below filter the already-fetched data instantly.'
-            '</div>'
-            '</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-        filter_pills = []
-        if selected_companies:
-            filter_pills += [f'<span class="pill">🏢 {safe_html(c)}</span>' for c in selected_companies]
-        if selected_vendors:
-            filter_pills += [f'<span class="pill">🏷️ {safe_html(v)}</span>' for v in selected_vendors]
-        if selected_categories:
-            filter_pills += [f'<span class="pill">📦 {safe_html(c)}</span>' for c in selected_categories]
-
-        if filter_pills:
-            st.markdown(f'<div class="filter-pill-row">{"".join(filter_pills)}</div>', unsafe_allow_html=True)
-
-        st.markdown("### Report")
-        st.caption(
-            "Click a non-zero **Sale Qty** or **Available Qty** to drill through "
-            "to the respective product cards."
-        )
-
-        total_rows = len(df)
-
-        page_size_options = [10, 25, 50, 100, 250, 500]
-        current_page_size = st.session_state["page_size"]
-        if current_page_size not in page_size_options:
-            page_size_options.append(current_page_size)
-            page_size_options.sort()
-
-        ctl1, ctl2, ctl3, ctl4 = st.columns([2, 2, 1, 1])
-
-        with ctl1:
-            new_page_size = st.selectbox(
-                "Rows per page",
-                options=page_size_options,
-                index=page_size_options.index(current_page_size),
-                key="page_size_selector",
-            )
-            if new_page_size != current_page_size:
-                st.session_state["page_size"] = new_page_size
-                st.session_state["page"] = 1
-                st.rerun()
-
-        total_pages = max(1, (total_rows + st.session_state["page_size"] - 1) // st.session_state["page_size"])
-
-        if st.session_state["page"] > total_pages:
-            st.session_state["page"] = total_pages
-
-        page = st.session_state["page"]
-        page_size = st.session_state["page_size"]
-
-        with ctl2:
-            st.markdown(
-                f'<div class="pagination-info">Page {page} of {total_pages} '
-                f'· {total_rows:,} rows</div>',
-                unsafe_allow_html=True,
-            )
-
-        with ctl3:
-            if st.button("← Prev", use_container_width=True, disabled=(page <= 1)):
-                st.session_state["page"] = page - 1
-                st.rerun()
-
-        with ctl4:
-            if st.button("Next →", use_container_width=True, disabled=(page >= total_pages)):
-                st.session_state["page"] = page + 1
-                st.rerun()
-
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        page_df = df.iloc[start_idx:end_idx]
-
-        render_report_table(
-            page_df,
-            raw_meta["start_date"],
-            raw_meta["end_date"],
-            build_report_state_params(
-                raw_meta["start_date"], raw_meta["end_date"],
-                selected_companies, selected_vendors, selected_categories,
-            ),
-        )
-
-        st.caption(
-            f"Showing rows {start_idx + 1:,}–{min(end_idx, total_rows):,} "
-            f"of {total_rows:,}"
-        )
-
-        b4, b5 = st.columns([1, 1])
-        with b4:
-            if st.button("← Prev ", use_container_width=True, disabled=(page <= 1), key="prev_bottom"):
-                st.session_state["page"] = page - 1
-                st.rerun()
-        with b5:
-            if st.button("Next → ", use_container_width=True, disabled=(page >= total_pages), key="next_bottom"):
-                st.session_state["page"] = page + 1
-                st.rerun()
-
-        if "sale_value" in df and "Vendor" in df and df["sale_value"].sum() > 0:
-            top_vendors = (
-                df.groupby("Vendor", dropna=False)["sale_value"]
-                .sum()
-                .sort_values(ascending=False)
-                .head(8)
-            )
+        # Sort before paging; totals below remain for the whole filtered result.
+        detail_keys = ["categ_id_name", "Vendor", "master_category", "company_id_name"]
+        detailed = aggregate_report(df, detail_keys)
+        detailed = detailed.sort_values([sort_field] + [k for k in detail_keys if k != sort_field], ascending=ascending, na_position="last", kind="stable")
+        page_size = st.selectbox("Rows per page", [25, 50, 100], key="report_page_size")
+        pages = max(1, (len(detailed) + page_size - 1) // page_size)
+        page_signature = str((tuple(df.index), sort_field, ascending, page_size))
+        page_key = "report_page_" + hashlib.sha256(page_signature.encode()).hexdigest()[:16]
+        page = st.selectbox("Page", list(range(1, pages + 1)), key=page_key)
+        page_rows = detailed.iloc[(page - 1) * page_size:page * page_size]
+        page_keys = page_rows[detail_keys]
+        page_facts = df.merge(page_keys, on=detail_keys, how="inner")
+        render_group_table(page_facts, detail_keys, meta, state, sort_field, ascending)
+        st.caption(f"Page {page}/{pages}. Table total is this page; filtered grand total follows.")
+        render_group_table(df, ["master_category"], meta, state, "master_category", True)
+    st.download_button("Download filtered data CSV", df.to_csv(index=False).encode("utf-8-sig"), "category_report.csv", "text/csv")
+    with st.expander("Top vendors by sales value", key="top_vendors", on_change="rerun") as vendor_chart:
+        if vendor_chart.open:
+            top_vendors = df.groupby("Vendor", dropna=False).sale_value.sum().sort_values(ascending=False).head(10)
             top_vendors.index = top_vendors.index.fillna("(No vendor)")
-
-            with st.expander("📈 Top vendors by sale value", expanded=False):
-                st.bar_chart(top_vendors)
-
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download CSV",
-            data=csv_bytes,
-            file_name=(
-                f"vendor_category_report_"
-                f"{raw_meta['start_date']}_{raw_meta['end_date']}.csv"
-            ),
-            mime="text/csv",
-        )
-    else:
-        st.info(
-            "Pick a **Date Range** on the left, then click **Fetch Data**. "
-            "Vendor / Category / Company filters unlock once data is loaded, "
-            "and won't need another database query."
-        )
+            st.bar_chart(top_vendors)
 
 
-# =====================================================================
-# View: Drill-through
-# =====================================================================
+def drill_query(kind, qp):
+    sql = AVAILABLE_SQL if kind == "available" else SALES_SQL
+    company_col = "i.company" if kind == "available" else "s.company"
+    vendor_col = "i.vendor" if kind == "available" else "p.vendor"
+    category_col = "i.category" if kind == "available" else "p.category"
+    marker = "WHERE ( (? = '' AND " + company_col
+    begin = sql.index(marker)
+    finish = sql.index("\nORDER BY", begin)
+    conditions = []
+    params = [] if kind == "available" else [qp.get("start_date", ""), qp.get("end_date", "")]
+    for column, scope_key, old_key, null_label in [(company_col, "d_companies", "company", "(No store)"), (vendor_col, "d_vendors", "vendor", NONE_VENDOR_LABEL), (category_col, "d_categories", "category", "(No category)")]:
+        values = _decode_list(qp.get(scope_key, "")) if qp.get("scope") == "group" else [_clean(qp.get(old_key, "")) or null_label]
+        predicate, values_params = scope_predicate(column, values, null_label)
+        conditions.append(predicate)
+        params.extend(values_params)
+    if kind == "available":
+        conditions.append("i.available_inventory <> 0")
+    return sql[:begin] + "WHERE " + " AND ".join(conditions) + sql[finish:], params
+
 
 def render_drillthrough(qp):
-    drill_type = _clean(qp.get("drill", "available")) or "available"
-    company = _clean(qp.get("company", ""))
-    vendor = _clean(qp.get("vendor", ""))
-    category = _clean(qp.get("category", ""))
-    start_date_str = _clean(qp.get("start_date", ""))
-    end_date_str = _clean(qp.get("end_date", ""))
-
-    try:
-        start_date = date.fromisoformat(start_date_str)
-    except Exception:
-        start_date = date.today()
-
-    try:
-        end_date = date.fromisoformat(end_date_str)
-    except Exception:
-        end_date = date.today()
-
-    if drill_type not in {"sales", "available"}:
-        drill_type = "available"
-
-    # Relative link back to the main view - same app, no MAIN_APP_URL needed.
-    # Carry the r_* (applied report filter) params forward so the main
-    # view can auto-restore the previously fetched report instead of
-    # showing the empty "click Fetch Data" state.
-    back_state = {k: v for k, v in dict(qp).items() if k.startswith("r_")}
-    back_href = f"?{urlencode(back_state)}" if back_state else "?"
-    st.markdown(
-        f'<a class="back-link" href="{back_href}" target="_self">← Back to Report</a>',
-        unsafe_allow_html=True,
-    )
-
+    kind = "sales" if qp.get("drill") == "sales" else "available"
+    mapping = load_master_mapping()
+    appearance_controls(qp)
+    back = {key: value for key, value in dict(qp).items() if key.startswith("r_")}
+    st.markdown(f'<a class="back-link" href="?{safe_html(urlencode(back))}" target="_self">← Back to report</a>', unsafe_allow_html=True)
+    st.title("Sold products" if kind == "sales" else "Available inventory")
     if not connection_is_configured():
-        st.error(
-            "SQL connection secrets are not configured. "
-            "Configure SQL_ENDPOINT, DATABASE, TENANT_ID, CLIENT_ID and CLIENT_SECRET."
-        )
-        st.stop()
-
+        st.error("Configure SQL connection secrets to load products.")
+        return
     try:
-        conn_str = build_connection_string(
-            SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID,
-        )
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-    if drill_type == "available":
-        title = "📦 Available Inventory"
-        subtitle = "Current inventory for the selected Vendor / Category / Company."
-        params = [company, company, vendor, vendor, category, category]
-        sql = AVAILABLE_SQL
-    else:
-        title = "🛍️ Sold Products"
-        subtitle = (
-            f"Products sold between {start_date:%d-%b-%Y} and "
-            f"{end_date:%d-%b-%Y}."
-        )
-        params = [
-            start_date.isoformat(), end_date.isoformat(),
-            company, company, vendor, vendor, category, category,
-        ]
-        sql = SALES_SQL
-
+        start = date.fromisoformat(qp.get("start_date", ""))
+        end = date.fromisoformat(qp.get("end_date", ""))
+        if start > end:
+            raise ValueError("Start date is after end date.")
+    except ValueError as error:
+        st.error(f"Invalid drill-through date range: {error}")
+        return
+    st.caption(f"Report period: {start:%d %b %Y} – {end:%d %b %Y}" if kind == "sales" else "Current inventory snapshot")
     with st.spinner("Loading products..."):
         try:
-            # Same run_query cache as the main report - if the main
-            # report already pulled overlapping data this session, or
-            # another user already drilled into the same combination,
-            # this can be a cache hit with zero DB round trip.
-            df = run_query(conn_str, sql, params)
-        except Exception as e:
-            st.error(f"Drill-through query failed: {e}")
-            st.stop()
-
-    st.markdown(
-        f'<div class="drill-hero"><h1>{title}</h1><p>{subtitle}</p></div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="context-row">'
-        f'<span class="context-chip">🏢 {company or "All companies"}</span>'
-        f'<span class="context-chip">🏷️ {vendor or "All vendors"}</span>'
-        f'<span class="context-chip">📦 {category or "All categories"}</span>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    if drill_type == "sales":
-        total_qty = df["sale_qty"].sum() if not df.empty else 0
-        total_value = df["sale_value"].sum() if not df.empty else 0
-        st.markdown(
-            '<div class="summary-box">'
-            f'<strong>Sales drill-through:</strong> '
-            f'{len(df):,} products · '
-            f'{total_qty:,.0f} units sold · '
-            f'₹{total_value:,.0f} sales value'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+            sql, params = drill_query(kind, qp)
+            conn_str = build_connection_string(SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID)
+            raw = run_query(conn_str, sql, params)
+        except Exception as error:
+            st.error(f"Product query failed: {error}")
+            return
+    raw = add_master_category(raw, mapping, "category")
+    st.sidebar.subheader("Product filters")
+    frame = raw
+    for column, label, null_label in [("company", "Store (company)", "(No store)"), ("vendor", "Vendor", NONE_VENDOR_LABEL), ("master_category", "Master category", None), ("category", "Category", None), ("location", "Location", "(No location)")]:
+        selected = select_filter(label, options(frame, column, null_label), f"drill_{kind}_{column}")
+        frame = frame[selected_mask(frame, column, selected, null_label)]
+    age_column = "sale_age" if kind == "sales" else "overall_age"
+    if kind == "sales":
+        reference_name = st.sidebar.selectbox("Days since sale reference", ["Today", "Report end date"])
+        reference = business_today() if reference_name == "Today" else end
+        frame = frame.copy()
+        frame["sold_date"] = pd.to_datetime(frame["sold_date"], errors="coerce")
+        frame[age_column] = (pd.Timestamp(reference) - frame.sold_date).dt.days
+        frame.attrs["age_reference"] = reference
     else:
-        total_qty = df["available_inventory"].sum() if not df.empty else 0
-        total_value = df["available_selling_price"].sum() if not df.empty else 0
-        st.markdown(
-            '<div class="summary-box">'
-            f'<strong>Inventory drill-through:</strong> '
-            f'{len(df):,} inventory rows · '
-            f'{total_qty:,.0f} units currently available · '
-            f'₹{total_value:,.0f} current stock value'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-    if df.empty:
-        st.warning("No products were found for this drill-through selection.")
-        with st.expander("🔍 Debug information", expanded=True):
-            st.write("**Drill type:**", drill_type)
-            st.write("**Company:**", repr(company))
-            st.write("**Vendor:**", repr(vendor))
-            st.write("**Category:**", repr(category))
-            st.write("**Start date:**", repr(start_date_str))
-            st.write("**End date:**", repr(end_date_str))
-            st.write("**Raw query params:**", dict(qp))
-            st.caption(
-                "If a value shows as 'None' or has trailing spaces, a "
-                "malformed parameter was sent. If the values look correct, "
-                "the underlying table has no rows for this combination."
-            )
-        st.stop()
-
-    # ---------------------------------------------------------------
-    # Resolve abfss:// images server-side via the Azure SDK.
-    # Adds a '_image_data_uri' column with data:image/...;base64,... URIs.
-    # ---------------------------------------------------------------
-    with st.spinner("Loading images..."):
-        df = resolve_images_for_df(df)
-
-    CARDS_PER_ROW = 4
-
-    for start in range(0, len(df), CARDS_PER_ROW):
-        chunk = df.iloc[start:start + CARDS_PER_ROW]
-        cols = st.columns(CARDS_PER_ROW)
-
-        for col, (_, row) in zip(cols, chunk.iterrows()):
-            with col:
-                if drill_type == "available":
-                    st.markdown(render_available_card(row), unsafe_allow_html=True)
-                else:
-                    st.markdown(render_sales_card(row), unsafe_allow_html=True)
-
-    st.caption(f"Showing {len(df):,} product rows.")
-
-    # Optional debug expander - remove once images are confirmed working.
-    if st.session_state.get("_show_image_debug"):
-        with st.expander("🐞 Image debug", expanded=True):
-            n_abfss = sum(
-                1 for r in df["image_1920"].fillna("").astype(str)
-                if r.startswith("abfss://")
-            )
-            n_resolved = df["_image_data_uri"].notna().sum()
-            st.write("Rows:", len(df))
-            st.write("Rows with abfss:// ref:", n_abfss)
-            st.write("Rows resolved to data URI:", int(n_resolved))
-            first = df["image_1920"].fillna("").astype(str)
-            first = first[first.str.startswith("abfss://")]
-            if not first.empty:
-                st.code(first.iloc[0], language="text")
+        frame = frame.copy()
+        # Recompute after cached queries so age cannot become stale at midnight.
+        frame[age_column] = (pd.Timestamp(business_today()) - pd.to_datetime(frame.stock_move_date, errors="coerce")).dt.days
+    with st.sidebar.expander("Age / days filter"):
+        minimum = st.number_input("Minimum days", min_value=0, value=0)
+        maximum = st.number_input("Maximum days", min_value=0, value=36500)
+        unknown = st.checkbox("Include unknown age", value=True)
+    age_mask = frame[age_column].between(minimum, maximum)
+    if unknown:
+        age_mask |= frame[age_column].isna()
+    frame = frame[age_mask]
+    if minimum > maximum:
+        st.warning("Minimum days must not exceed maximum days.")
+    if frame.empty:
+        st.info("No products match this selection.")
+        return
+    consolidated = st.toggle("Combine lots and stores into one card per product", value=True)
+    display = consolidate_products(frame, kind) if consolidated else frame.copy()
+    st.caption("Combined stock age is the oldest receipt age; combined sold date is the latest sale. Age filters apply to the underlying detail rows before totals are combined.")
+    qty = "sale_qty" if kind == "sales" else "available_inventory"
+    value = "sale_value" if kind == "sales" else "available_selling_price"
+    a, b, c = st.columns(3)
+    a.metric("Products", f"{frame.product_id.nunique():,}")
+    b.metric("Sold quantity" if kind == "sales" else "Available quantity", f"{frame[qty].sum():,.2f}")
+    c.metric("Sales value" if kind == "sales" else "Available value", f"₹{frame[value].sum():,.2f}")
+    sort_labels = {age_column: "Days since sale" if kind == "sales" else "Stock age (days)", value: "Sales value" if kind == "sales" else "Available value", qty: "Sold quantity" if kind == "sales" else "Available quantity", "product_name": "Product name", "sku": "SKU"}
+    if kind == "sales":
+        sort_labels["sold_date"] = "Sold date"
+    controls = st.columns([3, 1, 1])
+    with controls[0]:
+        sort = st.selectbox("Sort products by", list(sort_labels), format_func=sort_labels.get)
+    with controls[1]:
+        ascending = st.selectbox("Direction", ["Descending", "Ascending"]) == "Ascending"
+    with controls[2]:
+        size = st.selectbox("Cards per page", [12, 24, 48])
+    display = display.sort_values([sort, "product_id"], ascending=[ascending, True], na_position="last", kind="stable")
+    page_count = max(1, (len(display) + size - 1) // size)
+    # Scope/filters/sort changes reset pagination through the widget identity.
+    signature = str((tuple(frame.index), sort, ascending, size, consolidated))
+    page_key = "cards_page_" + hashlib.sha256(signature.encode()).hexdigest()[:16]
+    page = st.selectbox("Page", list(range(1, page_count + 1)), key=page_key)
+    visible = display.iloc[(page - 1) * size:page * size]
+    with st.spinner("Loading page images..."):
+        visible = resolve_images_for_df(visible)
+    for offset in range(0, len(visible), 4):
+        for container, (_, row) in zip(st.columns(4), visible.iloc[offset:offset + 4].iterrows()):
+            with container:
+                card = render_sales_card(row) if kind == "sales" else render_available_card(row)
+                st.markdown(card, unsafe_allow_html=True)
+                if consolidated:
+                    with st.expander("Lot, store and date details", key=f"product_details_{kind}_{row.product_id}", on_change="rerun") as details:
+                        if details.open:
+                            rows = frame[frame.product_id.eq(row.product_id)]
+                            detail_columns = [col for col in ["company", "location", "lot_number", "sold_date", "stock_move_date", age_column, qty, value] if col in rows]
+                            st.dataframe(rows[detail_columns], hide_index=True)
+    st.caption(f"Page {page}/{page_count} · {len(visible)} of {len(display):,} cards. Totals include all matching pages.")
+    st.download_button("Download product details CSV", frame.drop(columns=["image_1920"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), f"{kind}_products.csv", "text/csv")
 
 
 # =====================================================================
