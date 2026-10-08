@@ -359,30 +359,30 @@ st.markdown(
     @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap');
 
     :root {
-        --st-bg: #fffaf4;
-        --st-bg2: #fdf8f2;
-        --st-text: #3a1f28;
-        --muted: rgba(58,31,40,.65);
-        --gold: #b6871f;
-        --on-accent: #fff8ec;
-        --accent-chip: #8a1055;
-        --wine: #560835;
-        --wine2: #7c1049;
-        --card-border: #f0e2cd;
+        --st-bg: #ffffff;
+        --st-bg2: #ffffff;
+        --st-text: #202124;
+        --muted: rgba(32,33,36,.65);
+        --gold: #ffffff;
+        --on-accent: #202124;
+        --accent-chip: #ffffff;
+        --wine: #202124;
+        --wine2: #202124;
+        --card-border: #dddddd;
         --card-bg: #ffffff;
-        --card-shadow: rgba(58,31,40,.08);
-        --sidebar-border: #ecd9bd;
-        --select-border: #ddc4a0;
-        --pill-border: #ecd9bd;
-        --notice-bg-1: #fff7ed;
-        --notice-bg-2: #fffbeb;
-        --notice-border: #e3b23c;
-        --notice-title: #7c1049;
-        --notice-text: #5a2e1f;
-        --hero-shadow: rgba(86,8,53,.28);
-        --stock-bg: #12351f;
-        --stock-fg: #9fe1b2;
-        --border: #eadbc6;
+        --card-shadow: rgba(32,33,36,.08);
+        --sidebar-border: #dddddd;
+        --select-border: #dddddd;
+        --pill-border: #dddddd;
+        --notice-bg-1: #ffffff;
+        --notice-bg-2: #ffffff;
+        --notice-border: #dddddd;
+        --notice-title: #202124;
+        --notice-text: #202124;
+        --hero-shadow: rgba(32,33,36,.28);
+        --stock-bg: #ffffff;
+        --stock-fg: #202124;
+        --border: #dddddd;
     }
 
     html, body, .stApp {
@@ -410,7 +410,7 @@ st.markdown(
     [data-testid="collapsedControl"] {
         visibility: visible !important;
         display: flex !important;
-        color: #560835 !important;
+        color: #202124 !important;
         z-index: 999999 !important;
     }
 
@@ -421,26 +421,26 @@ st.markdown(
     }
 
     .hero, .drill-hero {
-        background: linear-gradient(120deg,#560835 0%,#7c1049 55%,#37041f 100%);
+        background: linear-gradient(120deg,#ffffff 0%,#ffffff 55%,#ffffff 100%);
         border-radius: 20px;
         padding: 26px 32px;
         margin-bottom: 22px;
         box-shadow: 0 10px 30px var(--hero-shadow);
         position: relative;
         overflow: hidden;
-        color: #fff8ec;
+        color: #202124;
     }
 
     .hero h1, .drill-hero h1 {
         font-family: 'Playfair Display', serif;
-        color: #fff8ec;
+        color: #202124;
         font-size: 2.1rem;
         font-weight: 800;
         margin: 0 0 4px 0;
     }
 
     .hero p, .drill-hero p {
-        color: #e9d488;
+        color: #202124;
         font-size: .95rem;
         margin: 0;
         font-weight: 500;
@@ -450,7 +450,7 @@ st.markdown(
         width: 64px;
         height: 3px;
         border-radius: 3px;
-        background: linear-gradient(90deg,#c9a227,#e9d488);
+        background: linear-gradient(90deg,#ffffff,#ffffff);
         margin-top: 12px;
     }
 
@@ -485,16 +485,16 @@ st.markdown(
     }
 
     button[kind="primary"] {
-        background: linear-gradient(120deg,#560835,#7c1049) !important;
-        border: 1px solid #37041f !important;
-        color: #fff8ec !important;
+        background: linear-gradient(120deg,#ffffff,#ffffff) !important;
+        border: 1px solid #ffffff !important;
+        color: #202124 !important;
     }
 
     [data-testid="stDownloadButton"] button {
         border-radius: 12px !important;
-        background: linear-gradient(120deg,#d8b34c,#b6871f) !important;
-        color: #2e2005 !important;
-        border: 1px solid #96721c !important;
+        background: linear-gradient(120deg,#ffffff,#ffffff) !important;
+        color: #202124 !important;
+        border: 1px solid #dddddd !important;
         font-weight: 700 !important;
     }
 
@@ -600,8 +600,8 @@ st.markdown(
         position: sticky;
         top: 0;
         z-index: 1;
-        background: #560835;
-        color: #fff8ec;
+        background: #ffffff;
+        color: #202124;
         padding: 12px 13px;
         text-align: left;
         font-size: 13px;
@@ -617,7 +617,7 @@ st.markdown(
     }
 
     .report-table tr:hover td {
-        background: rgba(182,135,31,.06);
+        background: #ffffff;
     }
 
     .qty-link {
@@ -626,15 +626,15 @@ st.markdown(
         text-align:center;
         padding:4px 9px;
         border-radius:8px;
-        background:#8a1055;
-        color:#fff8ec !important;
+        background:#ffffff;
+        color:#202124 !important;
         text-decoration:none !important;
         font-weight:700;
     }
 
     .qty-link:hover {
-        background:#560835;
-        box-shadow:0 3px 10px rgba(86,8,53,.25);
+        background:#ffffff;
+        box-shadow:0 3px 10px rgba(32,33,36,.25);
     }
 
     .zero-qty {
@@ -770,6 +770,29 @@ st.markdown(
         color: var(--wine2);
         opacity: .85;
     }
+
+    /* Native widgets and portal-mounted popovers share the white surfaces. */
+    :root { color-scheme: light; }
+    [data-testid="stHeader"],
+    [data-testid="stPopover"] button,
+    [data-testid="stPopoverBody"],
+    [data-testid="stDateInput"] input,
+    [data-baseweb="popover"] > div,
+    [data-baseweb="calendar"],
+    [data-baseweb="menu"],
+    [data-baseweb="tag"],
+    [data-testid="stAlert"],
+    [data-testid="stExpander"] details,
+    [data-testid="stNumberInput"] input,
+    [data-testid="stNumberInput"] button {
+        background: #ffffff !important;
+        color: #202124 !important;
+    }
+    [data-testid="stPopover"] button {
+        border: 1px solid #dddddd !important;
+        border-radius: 12px;
+    }
+    [data-testid="stPopover"] button p { color: #202124 !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1763,7 +1786,7 @@ def appearance_controls(qp, show_settings=True):
             ".report-table td {overflow:hidden;text-overflow:ellipsis;} "
             ".report-table td.dimension-cell {white-space:normal;overflow-wrap:anywhere;vertical-align:top;} "
             ".report-table td.pin-category,.report-table td.pin-vendor {background:var(--st-bg2);} "
-            ".report-table th.pin-category,.report-table th.pin-vendor {background:#560835;z-index:3;} "
+            ".report-table th.pin-category,.report-table th.pin-vendor {background:#ffffff;z-index:3;} "
             ".report-table th {position:sticky;top:0;} </style>")
 
 
@@ -1857,7 +1880,7 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
            ".pivot-hierarchy .tree-cell {min-width:320px;white-space:normal;} "
            ".pivot-hierarchy summary {cursor:pointer;} "
            ".pivot-hierarchy .master-row,.pivot-hierarchy .grand-total {font-weight:700;} "
-           ".pivot-hierarchy .grand-total td {border-bottom:2px solid #b6871f;} "]
+           ".pivot-hierarchy .grand-total td {border-bottom:2px solid #dddddd;} "]
     markup = ['<div class="report-table-wrap"><table class="report-table pivot-hierarchy"><thead><tr>']
     markup.extend(f"<th>{safe_html(header)}</th>" for header in headers)
     markup.append("</tr></thead><tbody>")
