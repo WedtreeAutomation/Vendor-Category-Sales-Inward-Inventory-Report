@@ -54,7 +54,7 @@ Set these in Streamlit secrets:
 Image loading uses the same service principal to read OneLake via the
 Azure Data Lake SDK. The service principal must have Fabric workspace
 read access plus OneLake data access to the workspace holding the
-Bronze lakehouse. Requires: azure-identity, azure-storage-filedatalake,
+Bronze lakehouse. Requires: azure-identity, azure-storage-file-datalake,
 Pillow.
 """
 
@@ -173,7 +173,7 @@ def read_category_mapping(path):
 
 def add_master_category(df, mapping, column):
     result = df.copy()
-    result["master_category"] = result[column].map(lambda value: mapping.get(category_key(value), "Unmapped"))
+    result["master_category"] = result[column].map(lambda value: mapping.get(category_key(value), str(value).strip() if pd.notna(value) and str(value).strip() else "(No category)"))
     return result
 
 
@@ -251,7 +251,7 @@ def report_export_frame(frame, view, sort_field, ascending, pivot_metric="sale_q
     return display_store_frame(result.rename(columns=LABELS))
 
 
-def report_pdf(frame, start, end, view, filters, measure=None):
+def report_pdf(frame, start, end, view, filters, measure=None, table_only=False):
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_RIGHT
     from reportlab.lib.pagesizes import A3, landscape
@@ -272,7 +272,9 @@ def report_pdf(frame, start, end, view, filters, measure=None):
     for label, values in filters.items():
         content.append(Paragraph(escape(f"{label}: {', '.join(display_store_name(value) for value in values) if values else 'All'}"), styles["Normal"]))
     content += [Paragraph("Sales and inward use the selected period. Available inventory is the current snapshot. Currency: INR.", styles["Normal"]), Spacer(1, 12)]
-    dimension_columns = [column for column in frame if column in {"Master category", "Category", "Vendor", "Store"}]
+    if table_only:
+        content = []
+    dimension_columns = [column for column in frame if not pd.api.types.is_numeric_dtype(frame[column])]
     weights = [2.8 if column in {"Category", "Store"} else 1.8 if column in dimension_columns else 1 for column in frame]
     widths = [page_width * weight / sum(weights) for weight in weights]
     data = [[Paragraph(escape(str(column)), heading) for column in frame]]
@@ -281,14 +283,19 @@ def report_pdf(frame, start, end, view, filters, measure=None):
         for column, value in record.items():
             numeric_cell = column not in dimension_columns and pd.api.types.is_numeric_dtype(frame[column])
             value_text = "(Not recorded)" if pd.isna(value) else f"{value:,.2f}" if numeric_cell else str(value)
-            cells.append(Paragraph(escape(value_text), numeric if numeric_cell else text))
+            escaped_text = escape(value_text)
+            if table_only and not numeric_cell:
+                padding = len(value_text) - len(value_text.lstrip())
+                escaped_text = "&#160;" * padding + escape(value_text.lstrip())
+            cells.append(Paragraph(escaped_text, numeric if numeric_cell else text))
         data.append(cells)
     # One total row, calculated only from the fact rows, not hierarchy subtotals.
     totals = []
     for index, column in enumerate(frame):
         value = "Grand total" if index == 0 else f"{frame[column].sum():,.2f}" if pd.api.types.is_numeric_dtype(frame[column]) else ""
         totals.append(Paragraph(escape(value), numeric if pd.api.types.is_numeric_dtype(frame[column]) else text))
-    data.insert(1, totals)
+    if not table_only:
+        data.insert(1, totals)
     table = LongTable(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
     table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#560835")),
                                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#dddddd")),
@@ -317,6 +324,75 @@ st.set_page_config(
 # =====================================================================
 # Secrets
 # =====================================================================
+
+def read_allowed_emails(path):
+    """Read the administrator-owned allowlist afresh on every app rerun."""
+    frame = pd.read_excel(path, dtype=str, keep_default_na=False, engine="openpyxl")
+    columns = {str(column).strip().casefold(): column for column in frame.columns}
+    if "email" not in columns:
+        raise ValueError("The access workbook needs an email column.")
+    return {
+        value.strip().casefold()
+        for value in frame[columns["email"]]
+        if value.strip()
+    }
+
+
+def require_google_access():
+    """Stop execution before any report data is loaded unless access is granted."""
+    try:
+        auth = st.secrets.get("auth", {})
+        google = auth.get("google", {})
+        configured = all(auth.get(key) for key in ("redirect_uri", "cookie_secret")) and all(
+            google.get(key) for key in ("client_id", "client_secret", "server_metadata_url")
+        )
+        access = st.secrets.get("access", {})
+    except Exception:
+        configured, access = False, {}
+
+    if not configured or not st.user.get("is_logged_in", False):
+        _, center, _ = st.columns([1, 2, 1])
+        with center:
+            st.space("large")
+            with st.container(border=True):
+                st.caption("PRASHANTI · INVENTORY & PURCHASE")
+                st.title("Welcome back")
+                st.write("Sign in with your approved Google account to view your reports.")
+                if not configured:
+                    st.info("Google sign-in is being configured. Please contact the administrator.")
+                if st.button("Sign in with Google", type="primary", width="stretch", disabled=not configured):
+                    st.login("google")
+                st.caption("Access is available to approved users only.")
+        st.stop()
+
+    email = str(st.user.get("email", "")).strip().casefold()
+    verified = st.user.get("email_verified") is True
+    google_issuer = st.user.get("iss") in ("https://accounts.google.com", "accounts.google.com")
+    workbook = Path(access.get("allowed_users_file", "allowed_users.xlsx"))
+    if not workbook.is_absolute():
+        workbook = Path(__file__).resolve().parent / workbook
+    try:
+        allowed = read_allowed_emails(workbook)
+    except (OSError, ValueError, ImportError, zipfile.BadZipFile):
+        st.error("User access could not be checked. Please contact the administrator.")
+        if st.button("Sign out", key="access_config_logout"):
+            st.logout()
+        st.stop()
+    if not email or not verified or not google_issuer or email not in allowed:
+        st.title("Access restricted")
+        st.error("Your account is not authorized. Please contact the administrator.")
+        if st.button("Sign out", key="access_denied_logout"):
+            st.logout()
+        st.stop()
+    with st.sidebar:
+        st.caption(f"Signed in as {email}")
+        if st.button("Sign out", key="account_logout"):
+            st.session_state.clear()
+            st.logout()
+
+
+require_google_access()
+
 
 def _get_secret(key):
     try:
@@ -441,7 +517,7 @@ st.markdown(
 
     .hero p, .drill-hero p {
         color: #202124;
-        font-size: .95rem;
+        font-size: 14px;
         margin: 0;
         font-weight: 500;
     }
@@ -512,7 +588,7 @@ st.markdown(
         color: var(--st-text);
         opacity: .62;
         text-transform: uppercase;
-        font-size: .72rem;
+        font-size: 14px;
         letter-spacing: .06em;
     }
 
@@ -530,13 +606,13 @@ st.markdown(
         border: 1px solid var(--pill-border);
         border-radius: 999px;
         padding: 3px 12px;
-        font-size: .8rem;
+        font-size: 14px;
         margin: 2px 6px 2px 0;
         font-weight: 600;
     }
 
     .context-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 20px; }
-    .context-row .context-chip { margin: 0; font-size: 13px; padding: 7px 12px; }
+    .context-row .context-chip { margin: 0; font-size: 14px; padding: 7px 12px; }
 
     .notice-card, .summary-box {
         display:flex;
@@ -558,11 +634,11 @@ st.markdown(
     .notice-title {
         font-weight:700;
         color:var(--notice-title);
-        font-size:14.5px;
+        font-size: 14px;
     }
     .notice-body {
         color:var(--notice-text);
-        font-size:13.5px;
+        font-size: 14px;
         margin-top:2px;
     }
 
@@ -574,7 +650,7 @@ st.markdown(
         border: 1px solid var(--card-border);
         border-radius: 999px;
         padding: 4px 12px;
-        font-size: 12px;
+        font-size: 14px;
         font-weight: 600;
         color: var(--st-text);
         opacity: .85;
@@ -604,7 +680,7 @@ st.markdown(
         color: #202124;
         padding: 12px 13px;
         text-align: left;
-        font-size: 13px;
+        font-size: 14px;
         white-space: nowrap;
     }
 
@@ -613,7 +689,7 @@ st.markdown(
         border-bottom: 1px solid var(--card-border);
         color: var(--st-text);
         white-space: nowrap;
-        font-size: 13px;
+        font-size: 14px;
     }
 
     .report-table tr:hover td {
@@ -650,7 +726,7 @@ st.markdown(
         padding:10px 4px;
         color: var(--st-text);
         opacity:.8;
-        font-size:13px;
+        font-size: 14px;
         font-weight:600;
     }
 
@@ -715,7 +791,7 @@ st.markdown(
     }
 
     .product-subtitle {
-        font-size: 13px;
+        font-size: 14px;
         color: var(--muted);
         line-height: 1.55;
         min-height: 41px;
@@ -728,7 +804,7 @@ st.markdown(
         gap: 10px;
         border-bottom: 1px dashed var(--border);
         padding: 7px 0;
-        font-size: 12.5px;
+        font-size: 14px;
     }
 
     .detail-label { color: var(--muted); }
@@ -750,7 +826,7 @@ st.markdown(
 
     .price {
         color: var(--wine2);
-        font-size: 21px;
+        font-size: 14px;
         font-weight: 800;
     }
 
@@ -759,14 +835,14 @@ st.markdown(
         color: var(--stock-fg);
         border-radius: 999px;
         padding: 7px 10px;
-        font-size: 11px;
+        font-size: 14px;
         font-weight: 800;
         white-space: nowrap;
     }
 
     .cost {
         margin-top: 5px;
-        font-size: 12px;
+        font-size: 14px;
         color: var(--wine2);
         opacity: .85;
     }
@@ -793,6 +869,78 @@ st.markdown(
         border-radius: 12px;
     }
     [data-testid="stPopover"] button p { color: #202124 !important; }
+    /* Streamlit's native select widgets no longer use BaseWeb wrappers. */
+    [data-testid="stWidgetLabel"],
+    [data-testid="stWidgetLabel"] p,
+    [data-testid="stCaptionContainer"],
+    [data-testid="stCaptionContainer"] p {
+        color: #202124 !important;
+    }
+    [data-testid="stSelectbox"] button,
+    [data-testid="stSelectbox"] [role="combobox"],
+    [data-testid="stMultiSelect"] > div,
+    [data-testid="stMultiSelect"] [role="combobox"],
+    [data-testid="stMultiSelectTagsContainer"],
+    [data-testid="stSelectboxVirtualDropdown"],
+    [data-testid="stMultiSelectDropdown"],
+    [data-testid="stSelectboxVirtualDropdown"] [role="option"],
+    [data-testid="stMultiSelectDropdown"] [role="option"] {
+        background: #ffffff !important;
+        color: #202124 !important;
+        border-color: #dddddd !important;
+    }
+    [data-testid="stSelectbox"] button *,
+    [data-testid="stMultiSelect"] *,
+    [data-testid="stSelectboxVirtualDropdown"] *,
+    [data-testid="stMultiSelectDropdown"] * {
+        color: #202124 !important;
+    }
+    [data-testid="stMultiSelect"] input {
+        background: #ffffff !important;
+        color: #202124 !important;
+        caret-color: #202124;
+    }
+    [data-testid="stMultiSelect"] input::placeholder {
+        color: #666666 !important;
+        opacity: 1;
+    }
+    [data-testid="stSelectboxVirtualDropdown"] [role="option"][data-focused],
+    [data-testid="stMultiSelectDropdown"] [role="option"][data-focused] {
+        outline: 1px solid #999999;
+        outline-offset: -1px;
+    }
+
+    /* One body size across native widgets and custom report/card content. */
+    .stApp p,
+    .stApp label,
+    .stApp input,
+    .stApp textarea,
+    .stApp button,
+    .stApp button p,
+    .stApp summary,
+    [data-testid="stWidgetLabel"] p,
+    [data-testid="stCaptionContainer"] p,
+    [data-testid="stMetricLabel"] p,
+    [data-testid="stMetricValue"],
+    [data-testid="stMetricValue"] div,
+    [data-testid="stSelectbox"] *,
+    [data-testid="stMultiSelect"] *,
+    [data-testid="stPopoverBody"] p,
+    [data-testid="stPopoverBody"] label,
+    [data-testid="stPopoverBody"] button,
+    [data-testid="stSelectboxVirtualDropdown"] *,
+    [data-testid="stMultiSelectDropdown"] *,
+    [data-baseweb="popover"] [role="option"] *,
+    [data-baseweb="calendar"] button,
+    .report-table td,
+    .product-subtitle,
+    .detail-row,
+    .price,
+    .stock-badge,
+    .cost,
+    .back-link {
+        font-size: 14px !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1761,20 +1909,20 @@ def appearance_controls(qp, show_settings=True):
         with st.sidebar.expander("Display settings"):
             size = st.slider("Table and card header size", 12, 24, max(12, min(24, default)), key="header_size")
     else:
-        size = 14
+        size = 16
         st.html("""<style>
             section[data-testid="stSidebar"] p,
             section[data-testid="stSidebar"] label,
             section[data-testid="stSidebar"] input,
             section[data-testid="stSidebar"] [data-baseweb="select"],
             section[data-testid="stSidebar"] [data-baseweb="select"] * {
-                font-size: 13px !important;
+                font-size: 14px !important;
             }
             div[data-baseweb="popover"] [role="option"],
             div[data-baseweb="popover"] [role="option"] *,
             [data-testid="stSelectboxVirtualDropdown"] li,
             [data-testid="stSelectboxVirtualDropdown"] li * {
-                font-size: 13px !important;
+                font-size: 14px !important;
             }
         </style>""")
     st.html(f"<style>.report-table th {{font-size:{size}px;}} .product-title {{font-size:{size}px;}} "
@@ -1870,12 +2018,41 @@ def render_group_table(frame, keys, meta, state, sort_field, ascending, totals_f
     return grouped
 
 
+_HIERARCHY_COMPONENT = st.components.v2.component(
+    "report_hierarchy",
+    html="<div class='hierarchy-root'></div>",
+    isolate_styles=False,
+    js="""
+export default function({data, parentElement, setStateValue}) {
+    const root = parentElement.querySelector('.hierarchy-root');
+    root.innerHTML = data.html;
+    const opened = new Set(data.opened);
+    const nodes = [...root.querySelectorAll('details')];
+    nodes.forEach(node => { node.open = opened.has(node.id); });
+    nodes.forEach(node => {
+        node.ontoggle = () => {
+            const next = nodes.filter(item => item.open).map(item => item.id);
+            if (JSON.stringify([...opened].sort()) !== JSON.stringify([...next].sort())) {
+                setStateValue('opened', next);
+            }
+        };
+    });
+    return () => nodes.forEach(node => { node.ontoggle = null; });
+}
+""",
+)
+
+
 def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_order=("Category", "Vendor", "Store")):
     dimensions = {"Store": ["company_id_name"], "Vendor": ["Vendor"],
                   "Category": ["master_category", "categ_id_name"]}
     levels = [key for name in pivot_order for key in dimensions[name]]
     headers = [" / ".join(pivot_order), "Sold qty", "Sales value", "Available qty",
                "Available value", "Inward qty", "Inward value"]
+    signature = hashlib.sha256(pd.util.hash_pandas_object(frame, index=True).values.tobytes() + str((pivot_order, sort_field, ascending)).encode()).hexdigest()[:16]
+    component_key = "hierarchy_" + signature
+    opened = st.session_state.get(component_key, {}).get("opened", [])
+    visible_rows = []
     css = [".pivot-hierarchy .nested-row {display:none;} "
            ".pivot-hierarchy .tree-cell {min-width:320px;white-space:normal;} "
            ".pivot-hierarchy summary {cursor:pointer;} "
@@ -1885,7 +2062,9 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
     markup.extend(f"<th>{safe_html(header)}</th>" for header in headers)
     markup.append("</tr></thead><tbody>")
 
-    def add_row(label, totals, classes, depth=0, toggle_id=None):
+    def add_row(label, totals, classes, depth=0, toggle_id=None, visible=True):
+        if visible:
+            visible_rows.append(["    " * depth + str(label)] + [float(totals[metric]) for metric in METRICS])
         markup.append(f'<tr class="{classes}"><td class="tree-cell" style="padding-left:{13 + depth * 22}px">')
         if toggle_id:
             toggle_class = "master-toggle" if depth == 0 else "category-toggle"
@@ -1918,13 +2097,15 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
                 css.append(f"{selector} .{row_class} {{display:table-row;}}")
             leaf = depth == len(levels) - 1
             label = value if pd.notna(value) else "(No vendor)" if key == "Vendor" else "(Not recorded)"
-            add_row(label, record, classes, depth, None if leaf else toggle_id)
+            add_row(label, record, classes, depth, None if leaf else toggle_id, all(ancestor in opened for ancestor in ancestors))
             if not leaf:
                 render_level(subset, depth + 1, ancestors + (toggle_id,), node)
     render_level(frame, 0, (), ())
     markup.append("</tbody></table></div>")
-    st.html("<style>" + "".join(css) + "</style>")
-    st.markdown("".join(markup), unsafe_allow_html=True)
+    table_html = "<style>" + "".join(css) + "</style>" + "".join(markup)
+    _HIERARCHY_COMPONENT(data={"html": table_html, "opened": opened}, key=component_key,
+                         default={"opened": []}, on_opened_change=lambda: None)
+    return pd.DataFrame(visible_rows, columns=headers)
 
 
 def render_main_report():
@@ -2003,9 +2184,7 @@ def render_main_report():
     meta = st.session_state.raw_meta
     raw = add_master_category(raw, mapping, "categ_id_name")
     labels = {"categ_id_name": "Category", "Vendor": "Vendor", "sale_qty": "Sold quantity", "sale_value": "Sales value", "available_qty": "Available quantity", "available_value": "Available value", "inward_qty": "Inward quantity", "inward_value": "Inward value"}
-    view_options = ["Category hierarchy", "Store pivot", "Detailed rows"]
-    if "report_view" not in st.session_state:
-        st.session_state.report_view = qp.get("r_view", view_options[0]) if qp.get("r_view") in view_options else view_options[0]
+    view = "Category hierarchy"
     if "report_sort" not in st.session_state:
         st.session_state.report_sort = qp.get("r_sort", "categ_id_name") if qp.get("r_sort") in labels else "categ_id_name"
     if "report_direction" not in st.session_state:
@@ -2016,56 +2195,24 @@ def render_main_report():
         masters = select_filter("Master category", options(raw, "master_category"), "report_masters", _decode_list(qp.get("r_masters", "")))
         category_source = raw[raw.master_category.isin(masters)] if masters else raw
         categories = select_filter("Category", options(category_source, "categ_id_name"), "report_categories", _decode_list(qp.get("r_categories", "")))
-        view = st.selectbox("Table view", view_options, key="report_view")
-        pivot_metric = st.selectbox("Pivot measure", METRICS, format_func=labels.get, key="pivot_metric") if view == "Store pivot" else "sale_qty"
         sort_field = st.selectbox("Sort by", list(labels), format_func=labels.get, key="report_sort")
         ascending = st.selectbox("Direction", ["Ascending", "Descending"], key="report_direction") == "Ascending"
-        unmapped = options(raw[raw.master_category.eq("Unmapped")], "categ_id_name")
-        if unmapped:
-            with st.expander(f"Unmapped categories ({len(unmapped)})"):
-                st.write(unmapped)
     mask = selected_mask(raw, "company_id_name", companies, "(No store)") & selected_mask(raw, "Vendor", vendors, NONE_VENDOR_LABEL) & selected_mask(raw, "master_category", masters) & selected_mask(raw, "categ_id_name", categories)
     df = raw[mask]
     if df.empty:
         st.info("No rows match these filters.")
         return
     state = {}
-    def select_pivot():
-        st.session_state.report_view = "Category hierarchy"
     pivot_orders = [order for count in (1, 2, 3) for order in permutations(("Store", "Vendor", "Category"), count)]
     with st.container(horizontal=True, horizontal_alignment="right"):
-        pivot_order = st.selectbox("Pivot order", pivot_orders, index=pivot_orders.index(("Category", "Vendor", "Store")), format_func=lambda order: " → ".join(order), key="pivot_order", on_change=select_pivot, width=360)
-    export = report_export_frame(df, view, sort_field, ascending, pivot_metric, pivot_order if view == "Category hierarchy" else None)
-    filters = {"Store": companies, "Vendor": vendors, "Master category": masters, "Category": categories}
-    if view == "Category hierarchy":
-        filters["Pivot order"] = list(pivot_order)
+        pivot_order = st.selectbox("Pivot order", pivot_orders, index=pivot_orders.index(("Category", "Vendor", "Store")), format_func=lambda order: " \u2192 ".join(order), key="pivot_order", width=360)
     table_area, download_area = st.columns([12, 1.5])
+    with table_area:
+        export = render_hierarchy_table(df, meta, state, sort_field, ascending, pivot_order)
     with download_area:
         filename = f"inventory_report_{meta['start_date']}_{meta['end_date']}"
-        st.download_button("CSV", export.to_csv(index=False).encode("utf-8-sig"), filename + ".csv", "text/csv", icon=":material/download:", width="stretch", on_click="ignore")
-        st.download_button("PDF", lambda: report_pdf(export, meta["start_date"], meta["end_date"], view, filters, labels.get(pivot_metric) if view == "Store pivot" else None), filename + ".pdf", "application/pdf", icon=":material/download:", width="stretch", on_click="ignore", help="Downloads all filtered rows, including rows on other pages.")
-    with table_area:
-        if view == "Category hierarchy":
-            render_hierarchy_table(df, meta, state, sort_field, ascending, pivot_order)
-        elif view == "Store pivot":
-            total_row = {column: export[column].sum() if pd.api.types.is_numeric_dtype(export[column]) else "Grand total" if index == 0 else "" for index, column in enumerate(export.columns)}
-            display = pd.concat([pd.DataFrame([total_row]), export], ignore_index=True)
-            st.dataframe(display, hide_index=True, width="stretch")
-        else:
-            detail_keys = ["categ_id_name", "Vendor", "master_category", "company_id_name"]
-            detailed = aggregate_report(df, detail_keys)
-            detailed = detailed.sort_values([sort_field] + [k for k in detail_keys if k != sort_field], ascending=[ascending] + [True] * (len(detail_keys) - (sort_field in detail_keys)), na_position="last", kind="stable")
-            paging = st.columns([1, 1, 5])
-            with paging[0]:
-                page_size = st.selectbox("Rows", [25, 50, 100], key="report_page_size", label_visibility="collapsed")
-            pages = max(1, (len(detailed) + page_size - 1) // page_size)
-            page_signature = str((tuple(df.index), sort_field, ascending, page_size))
-            page_key = "report_page_" + hashlib.sha256(page_signature.encode()).hexdigest()[:16]
-            with paging[1]:
-                page = st.selectbox("Page", list(range(1, pages + 1)), key=page_key, label_visibility="collapsed")
-            page_rows = detailed.iloc[(page - 1) * page_size:page * page_size]
-            page_facts = df.merge(page_rows[detail_keys], on=detail_keys, how="inner")
-            render_group_table(page_facts, detail_keys, meta, state, sort_field, ascending, totals_frame=df)
+        st.download_button("CSV", export.to_csv(index=False, float_format="%.2f").encode("utf-8-sig"), filename + ".csv", "text/csv", icon=":material/download:", width="stretch", on_click="ignore", help="Downloads the current table, including only expanded rows.")
+        st.download_button("PDF", lambda: report_pdf(export, meta["start_date"], meta["end_date"], view, {}, table_only=True), filename + ".pdf", "application/pdf", icon=":material/download:", width="stretch", on_click="ignore", help="Downloads the current table, including only expanded rows.")
 
 
 def drill_query(kind, qp):
