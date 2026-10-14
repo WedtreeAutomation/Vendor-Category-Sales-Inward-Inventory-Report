@@ -433,24 +433,23 @@ AGGREGATE_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap');
 
     :root {
         --st-bg: #ffffff;
         --st-bg2: #ffffff;
         --st-text: #202124;
         --muted: rgba(32,33,36,.65);
-        --gold: #ffffff;
-        --on-accent: #202124;
-        --accent-chip: #ffffff;
-        --wine: #202124;
-        --wine2: #202124;
+        --gold: #c9a24b;
+        --on-accent: #ffffff;
+        --accent-chip: #e5dbed;
+        --wine: #560835;
+        --wine2: #850c52;
         --card-border: #dddddd;
         --card-bg: #ffffff;
         --card-shadow: rgba(32,33,36,.08);
-        --sidebar-border: #dddddd;
+        --sidebar-border: #d4c3e1;
         --select-border: #dddddd;
-        --pill-border: #dddddd;
+        --pill-border: #d4c3e1;
         --notice-bg-1: #ffffff;
         --notice-bg-2: #ffffff;
         --notice-border: #dddddd;
@@ -463,7 +462,7 @@ st.markdown(
     }
 
     html, body, .stApp {
-        font-family: 'Inter', -apple-system, sans-serif;
+        font-family: inherit;
     }
 
     .stApp {
@@ -492,7 +491,7 @@ st.markdown(
     }
 
     .block-container {
-        padding-top: 1.4rem;
+        padding-top: 4.5rem;
         padding-bottom: 3rem;
         max-width: 1450px;
     }
@@ -509,7 +508,7 @@ st.markdown(
     }
 
     .hero h1, .drill-hero h1 {
-        font-family: 'Playfair Display', serif;
+        font-family: inherit;
         color: #202124;
         font-size: 2.1rem;
         font-weight: 800;
@@ -595,7 +594,7 @@ st.markdown(
 
     [data-testid="stMetricValue"] {
         color: var(--st-text);
-        font-family: 'Playfair Display', serif;
+        font-family: inherit;
         font-weight: 700;
     }
 
@@ -909,6 +908,36 @@ st.markdown(
     [data-testid="stMultiSelectDropdown"] [role="option"][data-focused] {
         outline: 1px solid #999999;
         outline-offset: -1px;
+    }
+
+    /* Prashanti Sarees palette; preserve Streamlit's default font. */
+    .stApp h1, .stApp h2, .stApp h3 { color: #560835; }
+    .stApp a { color: #560835; }
+    [data-testid="stDownloadButton"] button {
+        border-color: #560835;
+        color: #560835;
+    }
+    .report-table th { background: #560835 !important; color: #ffffff !important; }
+    .report-table .grand-total td { background: #FBF6EC; border-bottom-color: #c9a24b; }
+    [data-testid="stMultiSelectTagsContainer"] { height: auto !important; max-height: none !important; }
+    [data-testid="stMultiSelect"] [data-baseweb="tag"],
+    [data-testid="stMultiSelect"] [data-tag] {
+        height: auto !important;
+        max-width: 100%;
+        background: #e5dbed !important;
+    }
+    [data-testid="stMultiSelect"] [data-baseweb="tag"] span,
+    [data-testid="stMultiSelect"] [data-tag] [title] {
+        white-space: normal !important;
+        overflow-wrap: anywhere;
+        text-overflow: clip !important;
+        max-height: none !important;
+    }
+    [data-testid="stMultiSelectDropdown"] [role="option"] {
+        white-space: normal !important;
+        overflow-wrap: anywhere;
+        height: auto !important;
+        min-height: 2.5rem;
     }
 
     /* One body size across native widgets and custom report/card content. */
@@ -1952,7 +1981,12 @@ def select_filter(label, values, key, defaults=(), target=None):
     else:
         st.session_state[key] = [value for value in st.session_state[key] if value in values]
     target = st.sidebar if target is None else target
-    return target.multiselect(label, values, key=key, format_func=display_store_name)
+    selected = target.multiselect(label, values, key=key, format_func=display_store_name)
+    if label in {"Category", "Master category"} and selected:
+        with target.expander(f"Selected {label.lower()} names ({len(selected)})"):
+            for value in selected:
+                st.text(value)
+    return selected
 
 
 def selected_mask(df, column, values, null_label=None):
@@ -2203,17 +2237,23 @@ def render_main_report():
     if df.empty:
         st.info("No rows match these filters.")
         return
+    render_report_section(df, meta, sort_field, ascending)
+
+
+@st.fragment
+def render_report_section(df, meta, sort_field, ascending):
+    """Keep hierarchy toggles and visible-row exports within one partial rerun."""
+    view = "Category hierarchy"
+    download_toolbar = st.container(horizontal=True, horizontal_alignment="right")
     state = {}
     pivot_orders = [order for count in (1, 2, 3) for order in permutations(("Store", "Vendor", "Category"), count)]
     with st.container(horizontal=True, horizontal_alignment="right"):
         pivot_order = st.selectbox("Pivot order", pivot_orders, index=pivot_orders.index(("Category", "Vendor", "Store")), format_func=lambda order: " \u2192 ".join(order), key="pivot_order", width=360)
-    table_area, download_area = st.columns([12, 1.5])
-    with table_area:
-        export = render_hierarchy_table(df, meta, state, sort_field, ascending, pivot_order)
-    with download_area:
+    export = render_hierarchy_table(df, meta, state, sort_field, ascending, pivot_order)
+    with download_toolbar:
         filename = f"inventory_report_{meta['start_date']}_{meta['end_date']}"
-        st.download_button("CSV", export.to_csv(index=False, float_format="%.2f").encode("utf-8-sig"), filename + ".csv", "text/csv", icon=":material/download:", width="stretch", on_click="ignore", help="Downloads the current table, including only expanded rows.")
-        st.download_button("PDF", lambda: report_pdf(export, meta["start_date"], meta["end_date"], view, {}, table_only=True), filename + ".pdf", "application/pdf", icon=":material/download:", width="stretch", on_click="ignore", help="Downloads the current table, including only expanded rows.")
+        st.download_button("CSV", export.to_csv(index=False, float_format="%.2f").encode("utf-8-sig"), filename + ".csv", "text/csv", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
+        st.download_button("PDF", lambda: report_pdf(export, meta["start_date"], meta["end_date"], view, {}, table_only=True), filename + ".pdf", "application/pdf", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
 
 
 def drill_query(kind, qp):
