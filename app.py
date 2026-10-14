@@ -911,6 +911,13 @@ st.markdown(
     }
 
     /* Prashanti Sarees palette; preserve Streamlit's default font. */
+    [data-testid="stMultiSelect"] button,
+    [data-testid="stMultiSelect"] [role="combobox"] {
+        background: #ffffff !important;
+        color: #202124 !important;
+        color-scheme: light;
+    }
+    [data-testid="stMultiSelect"] svg { color: #560835 !important; }
     .stApp h1, .stApp h2, .stApp h3 { color: #560835; }
     .stApp a { color: #560835; }
     [data-testid="stDownloadButton"] button {
