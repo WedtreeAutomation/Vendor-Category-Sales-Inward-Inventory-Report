@@ -358,10 +358,11 @@ def require_google_access():
                 st.caption("PRASHANTI · INVENTORY & PURCHASE")
                 st.title("Welcome back")
                 st.write("Sign in with your approved Google account to view your reports.")
-                if not configured:
-                    st.info("Google sign-in is being configured. Please contact the administrator.")
-                if st.button("Sign in with Google", type="primary", width="stretch", disabled=not configured):
-                    st.login("google")
+                if st.button("Sign in with Google", type="primary", width="stretch"):
+                    if configured:
+                        st.login("google")
+                    else:
+                        st.error("Google sign-in is unavailable because the app's authentication settings are incomplete. Please contact the administrator.")
                 st.caption("Access is available to approved users only.")
         st.stop()
 
