@@ -62,6 +62,7 @@ import base64
 import hashlib
 from itertools import permutations
 import io
+import json
 import time
 import posixpath
 import re
@@ -173,7 +174,7 @@ def read_category_mapping(path):
 
 def add_master_category(df, mapping, column):
     result = df.copy()
-    result["master_category"] = result[column].map(lambda value: mapping.get(category_key(value), str(value).strip() if pd.notna(value) and str(value).strip() else "(No category)"))
+    result["master_category"] = result[column].map(lambda value: mapping.get(category_key(value), "Unmatched category") if pd.notna(value) and str(value).strip() else "Unmatched category")
     return result
 
 
@@ -251,15 +252,18 @@ def report_export_frame(frame, view, sort_field, ascending, pivot_metric="sale_q
     return display_store_frame(result.rename(columns=LABELS))
 
 
-def report_pdf(frame, start, end, view, filters, measure=None, table_only=False):
+def report_pdf(frame, start, end, view, filters, measure=None, table_only=False, logo_path=None):
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_RIGHT
     from reportlab.lib.pagesizes import A3, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.utils import ImageReader
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, LongTable, TableStyle
 
     output = BytesIO()
     pagesize = landscape(A3)
+    logo_file = Path(logo_path) if logo_path is not None else Path(__file__).resolve().parent / "assets" / "prashanti-logo.png"
+    logo = ImageReader(BytesIO(logo_file.read_bytes())) if logo_file.is_file() else None
     page_width = pagesize[0] - 48
     styles = getSampleStyleSheet()
     text = ParagraphStyle("Report cell", fontName="Helvetica", fontSize=7, leading=9, splitLongWords=True)
@@ -306,11 +310,21 @@ def report_pdf(frame, start, end, view, filters, measure=None, table_only=False)
     content.append(table)
     def footer(canvas, doc):
         canvas.saveState()
+        if logo is not None:
+            # The website's white logo needs its burgundy background for contrast.
+            logo_width, logo_height = logo.getSize()
+            width = 132
+            height = width * logo_height / logo_width
+            x = pagesize[0] - 24 - width - 12
+            y = pagesize[1] - 18 - height - 12
+            canvas.setFillColor(colors.HexColor("#560835"))
+            canvas.roundRect(x, y, width + 12, height + 12, 3, fill=1, stroke=0)
+            canvas.drawImage(logo, x + 6, y + 6, width=width, height=height, mask="auto")
         canvas.setFont("Helvetica", 8)
         canvas.drawRightString(pagesize[0] - 24, 14, f"Page {doc.page}")
         canvas.restoreState()
     SimpleDocTemplate(output, pagesize=pagesize, leftMargin=24, rightMargin=24,
-                      topMargin=24, bottomMargin=30).build(content, onFirstPage=footer, onLaterPages=footer)
+                      topMargin=78 if logo is not None else 24, bottomMargin=30).build(content, onFirstPage=footer, onLaterPages=footer)
     return output.getvalue()
 
 
@@ -1171,8 +1185,6 @@ WITH product_master AS (
     FROM WT_LH_Silver.Odoo.product_product p
     LEFT JOIN WT_LH_Silver.Odoo.product_template pt
         ON p.product_variant_id = pt.product_variant_id
-    WHERE p.categ_id_name IS NOT NULL
-      AND LOWER(p.categ_id_name) NOT LIKE '%admin%'
 ),
 
 sales_data AS (
@@ -1213,7 +1225,6 @@ sales_summary AS (
     FROM sales_data sd
     LEFT JOIN product_master pm
         ON CAST(sd.product_id AS VARCHAR(50)) = pm.product_id
-    WHERE pm.category IS NOT NULL
     GROUP BY
         sd.company_id_name,
         pm.product_vendor,
@@ -1243,7 +1254,6 @@ inward_summary AS (
       AND pk.location_id_name = 'Partners/Vendors'
       AND CAST(pk.date_done AS DATE) >= ?
       AND CAST(pk.date_done AS DATE) <= ?
-      AND pm.category IS NOT NULL
     GROUP BY
         pk.company_id_name,
         pm.product_vendor,
@@ -1264,7 +1274,6 @@ inventory_summary AS (
             'Saree Trails',
             'Wedtree eStore Private Limited - HO'
       )
-      AND pm.category IS NOT NULL
     GROUP BY
         sq.company_id_name,
         pm.product_vendor,
@@ -1323,10 +1332,10 @@ def build_query_and_params(start_str, end_str):
 
 
 @st.cache_data(ttl=AGGREGATE_CACHE_TTL_SECONDS, show_spinner=False)
-def get_aggregate_data(conn_str, start_str, end_str):
-    """The one and only SQL round trip for the report. Cached for
+def get_aggregate_data(conn_str, start_str, end_str, query_revision="include-unmatched-v1"):
+    """Fetch report totals including unmatched and missing categories. Cached for
     AGGREGATE_CACHE_TTL_SECONDS (6 hours), keyed on the connection
-    string + date range. Every Vendor/Category/Company tweak below
+    string + date range + query revision. Every Vendor/Category/Company tweak below
     reuses this exact DataFrame — no new query."""
     sql, params = build_query_and_params(start_str, end_str)
     return run_query(conn_str, sql, params)
@@ -1398,8 +1407,6 @@ WITH product_base AS (
     FROM WT_LH_Silver.Odoo.product_product p
     LEFT JOIN WT_LH_Silver.Odoo.product_template pt
         ON p.product_variant_id = pt.product_variant_id
-    WHERE p.categ_id_name IS NOT NULL
-      AND LOWER(p.categ_id_name) NOT LIKE '%admin%'
 ),
 product_images AS (
     SELECT product_id, image_1920
@@ -1499,7 +1506,6 @@ inventory_detail AS (
         'Saree Trails',
         'Wedtree eStore Private Limited - HO'
     )
-      AND p.category IS NOT NULL
 )
 SELECT
     i.company,
@@ -1982,6 +1988,9 @@ def appearance_controls(qp, show_settings=True):
 
 def options(df, column, null_label=None):
     values = sorted(df[column].dropna().astype(str).unique().tolist())
+    if column == "master_category" and "Unmatched category" in values:
+        values.remove("Unmatched category")
+        values.append("Unmatched category")
     if null_label is not None and df[column].isna().any():
         values.insert(0, null_label)
     return values
@@ -2072,21 +2081,75 @@ _HIERARCHY_COMPONENT = st.components.v2.component(
     js="""
 export default function({data, parentElement, setStateValue}) {
     const root = parentElement.querySelector('.hierarchy-root');
-    const ageOpened = new Set([...root.querySelectorAll('.quantity-age-toggle[open]')].map(node => node.id));
-    root.innerHTML = data.html;
-    const opened = new Set(data.opened);
-    const nodes = [...root.querySelectorAll('details')];
-    nodes.forEach(node => { node.open = opened.has(node.id) || ageOpened.has(node.id); });
+    const changed = root._reportHtml !== data.html;
+    if (changed) {
+        root.innerHTML = data.html;
+        root._reportHtml = data.html;
+        root._reportNodes = [...root.querySelectorAll('details')];
+        root._reportRows = [...root.querySelectorAll('tr[data-ancestors]')].map(row => ({row, ancestors: JSON.parse(row.dataset.ancestors)}));
+    }
+    const nodes = root._reportNodes;
+    const hierarchy = nodes.filter(node => !node.classList.contains('quantity-age-toggle'));
+    const rows = root._reportRows;
+    const opened = new Set(data.opened.filter(id => !id.startsWith('age-')));
+    if (changed) hierarchy.forEach(node => { node.open = opened.has(node.id); });
+    const updateRows = () => {
+        const active = new Set(hierarchy.filter(node => node.open).map(node => node.id));
+        const visible = rows.filter(({ancestors}) => ancestors.every(id => active.has(id))).map(({row}) => {
+            row.hidden = false;
+            return row;
+        });
+        const body = root.querySelector('.pivot-hierarchy>tbody');
+        if (body.children.length !== visible.length || visible.some((row, index) => body.children[index] !== row)) {
+            body.replaceChildren(...visible);
+        }
+    };
+    updateRows();
+    let timer;
     nodes.forEach(node => {
         node.ontoggle = () => {
-            if (node.classList.contains('quantity-age-toggle')) return;
-            const next = nodes.filter(item => item.open && !item.classList.contains('quantity-age-toggle')).map(item => item.id);
+            if (node.classList.contains('quantity-age-toggle')) {
+                if (node.open) {
+                    const body = node.querySelector('[data-quantities]');
+                    if (body && !body.dataset.ready) {
+                        body.dataset.ready = 'true';
+                        const boxes = document.createElement('div');
+                        boxes.className = 'quantity-age-boxes';
+                        boxes.style.cssText = 'display:flex;flex-wrap:nowrap;gap:4px;margin-top:6px';
+                        JSON.parse(body.dataset.quantities).forEach((qty, index) => {
+                            const box = document.createElement('div');
+                            box.style.cssText = `background:${data.ageColors[index]};color:#111827;border:1px solid #9ca3af;border-radius:3px;padding:5px 7px;text-align:center;white-space:nowrap;min-width:54px`;
+                            box.title = data.ageBands[index] + ' days';
+                            const value = document.createElement('div');
+                            value.style.cssText = 'font-size:15px;font-weight:700';
+                            value.textContent = Number(qty).toLocaleString('en-IN', {minimumFractionDigits:0, maximumFractionDigits:0});
+                            box.append(value);
+                            boxes.append(box);
+                        });
+                        body.append(boxes);
+                        if (Number(body.dataset.unknown)) {
+                            const unknown = document.createElement('div');
+                            unknown.textContent = 'Age unavailable: qty ' + Number(body.dataset.unknown).toLocaleString('en-IN', {maximumFractionDigits:0});
+                            unknown.title = 'The inward or sale date is missing, or is later than the age reference date. These quantities are excluded from the five age bands.';
+                            body.append(unknown);
+                        }
+                    }
+                }
+                return;
+            }
+            updateRows();
+            const next = hierarchy.filter(item => item.open).map(item => item.id);
+            clearTimeout(timer);
             if (JSON.stringify([...opened].sort()) !== JSON.stringify([...next].sort())) {
-                setStateValue('opened', next);
+                timer = setTimeout(() => {
+                    opened.clear();
+                    next.forEach(id => opened.add(id));
+                    setStateValue('opened', next);
+                }, 200);
             }
         };
     });
-    return () => nodes.forEach(node => { node.ontoggle = null; });
+    return () => { clearTimeout(timer); nodes.forEach(node => { node.ontoggle = null; }); };
 }
 """,
 )
@@ -2094,16 +2157,31 @@ export default function({data, parentElement, setStateValue}) {
 
 @st.fragment
 def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_order=("Category", "Vendor", "Store")):
+    signature = hashlib.sha256(pd.util.hash_pandas_object(frame, index=True).values.tobytes() + str((pivot_order, sort_field, ascending)).encode()).hexdigest()[:16]
+    component_key = "hierarchy_" + signature
+    opened = st.session_state.get(component_key, {}).get("opened", [])
+    table_html, headers, rows, ancestors = build_hierarchy_content(frame, meta, sort_field, ascending, pivot_order)
+    _HIERARCHY_COMPONENT(data={"html": table_html, "opened": opened, "ageBands": AGE_BANDS, "ageColors": list(AGE_COLORS.values())}, key=component_key,
+                         default={"opened": []}, on_opened_change=lambda: None)
+    active = set(opened)
+    export = pd.DataFrame([row for row, path in zip(rows, ancestors) if all(node in active for node in path)], columns=headers)
+    st.session_state.current_report_export = export
+    holder = st.session_state.get("report_export_holder")
+    if holder is not None:
+        holder["frame"] = export
+    return export
+
+
+@st.cache_data(ttl=21600, max_entries=16, show_spinner=False)
+def build_hierarchy_content(frame, meta, sort_field, ascending, pivot_order):
     dimensions = {"Store": ["company_id_name"], "Vendor": ["Vendor"],
                   "Category": ["master_category", "categ_id_name"]}
     levels = [key for name in pivot_order for key in dimensions[name]]
     headers = [" / ".join(pivot_order), "Sold qty", "Sales value", "Available qty",
                "Available value", "Inward qty", "Inward value"]
-    signature = hashlib.sha256(pd.util.hash_pandas_object(frame, index=True).values.tobytes() + str((pivot_order, sort_field, ascending)).encode()).hexdigest()[:16]
-    component_key = "hierarchy_" + signature
-    opened = st.session_state.get(component_key, {}).get("opened", [])
     visible_rows = []
-    css = [".pivot-hierarchy .nested-row {display:none;} "
+    row_ancestors = []
+    css = [".pivot-hierarchy tr[hidden] {display:none !important;} "
            ".pivot-hierarchy .tree-cell {min-width:320px;white-space:normal;} "
            ".pivot-hierarchy summary {cursor:pointer;} "
            ".pivot-hierarchy .master-row,.pivot-hierarchy .grand-total {font-weight:700;} "
@@ -2112,10 +2190,10 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
     markup.extend(f"<th>{safe_html(header)}</th>" for header in headers)
     markup.append("</tr></thead><tbody>")
 
-    def add_row(label, totals, classes, depth=0, toggle_id=None, visible=True, scope=None, row_id="total"):
-        if visible:
-            visible_rows.append(["    " * depth + str(label)] + [float(totals[metric]) for metric in METRICS])
-        markup.append(f'<tr class="{classes}"><td class="tree-cell" style="padding-left:{13 + depth * 22}px">')
+    def add_row(label, totals, classes, depth=0, toggle_id=None, visible=True, scope=None, row_id="total", ancestors=()):
+        visible_rows.append(["    " * depth + str(label)] + [float(totals[metric]) for metric in METRICS])
+        row_ancestors.append(ancestors)
+        markup.append(f'<tr class="{classes}" data-ancestors="{safe_html(json.dumps(ancestors))}"' + (' hidden' if depth else '') + f'><td class="tree-cell" style="padding-left:{13 + depth * 22}px">')
         if toggle_id:
             toggle_class = "master-toggle" if depth == 0 else "category-toggle"
             markup.append(f'<details id="{toggle_id}" class="{toggle_class}"><summary>{safe_html(label)}</summary></details>')
@@ -2143,6 +2221,9 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
         primary = sort_field if sort_field in METRICS else key
         fields = [primary] + ([key] if key != primary else [])
         grouped = grouped.sort_values(fields, ascending=[ascending] + ([True] if key != primary else []), na_position="last", kind="stable")
+        if key == "master_category":
+            unmatched = grouped[key].eq("Unmatched category")
+            grouped = pd.concat([grouped[~unmatched], grouped[unmatched]], ignore_index=True)
         for index, (_, record) in enumerate(grouped.iterrows()):
             value = record[key]
             subset = group[group[key].isna() if pd.isna(value) else group[key].eq(value)]
@@ -2151,22 +2232,15 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
             toggle_id = "pivot-node-" + node_suffix
             row_class = "pivot-row-" + node_suffix
             classes = "master-row" if depth == 0 else f"nested-row {row_class} " + ("vendor-row pivot-vendors-" + node_suffix if key == "Vendor" else "category-row")
-            if depth:
-                selector = ".pivot-hierarchy" + "".join(f":has(#{ancestor}[open])" for ancestor in ancestors)
-                css.append(f"{selector} .{row_class} {{display:table-row;}}")
             leaf = depth == len(levels) - 1
-            label = value if pd.notna(value) else "(No vendor)" if key == "Vendor" else "(Not recorded)"
-            add_row(label, record, classes, depth, None if leaf else toggle_id, all(ancestor in opened for ancestor in ancestors), subset, node_suffix)
+            label = value if pd.notna(value) else "(No vendor)" if key == "Vendor" else "(No category)" if key == "categ_id_name" else "(Not recorded)"
+            add_row(label, record, classes, depth, None if leaf else toggle_id, True, subset, node_suffix, ancestors)
             if not leaf:
                 render_level(subset, depth + 1, ancestors + (toggle_id,), node)
     render_level(frame, 0, (), ())
     markup.append("</tbody></table></div>")
     table_html = "<style>" + "".join(css) + "</style>" + "".join(markup)
-    _HIERARCHY_COMPONENT(data={"html": table_html, "opened": opened}, key=component_key,
-                         default={"opened": []}, on_opened_change=lambda: None)
-    export = pd.DataFrame(visible_rows, columns=headers)
-    st.session_state.current_report_export = export
-    return export
+    return table_html, headers, visible_rows, row_ancestors
 
 
 def render_main_report():
@@ -2242,10 +2316,10 @@ def render_main_report():
         vendors = select_filter("Vendor", options(raw, "Vendor", NONE_VENDOR_LABEL), "report_vendors", _decode_list(qp.get("r_vendors", "")))
         masters = select_filter("Master category", options(raw, "master_category"), "report_masters", _decode_list(qp.get("r_masters", "")))
         category_source = raw[raw.master_category.isin(masters)] if masters else raw
-        categories = select_filter("Category", options(category_source, "categ_id_name"), "report_categories", _decode_list(qp.get("r_categories", "")))
+        categories = select_filter("Category", options(category_source, "categ_id_name", "(No category)"), "report_categories", _decode_list(qp.get("r_categories", "")))
         sort_field = st.selectbox("Sort by", list(labels), format_func=labels.get, key="report_sort")
         ascending = st.selectbox("Direction", ["Ascending", "Descending"], key="report_direction") == "Ascending"
-    mask = selected_mask(raw, "company_id_name", companies, "(No store)") & selected_mask(raw, "Vendor", vendors, NONE_VENDOR_LABEL) & selected_mask(raw, "master_category", masters) & selected_mask(raw, "categ_id_name", categories)
+    mask = selected_mask(raw, "company_id_name", companies, "(No store)") & selected_mask(raw, "Vendor", vendors, NONE_VENDOR_LABEL) & selected_mask(raw, "master_category", masters) & selected_mask(raw, "categ_id_name", categories, "(No category)")
     df = raw[mask]
     if df.empty:
         st.info("No rows match these filters.")
@@ -2261,11 +2335,16 @@ def render_report_section(df, meta, sort_field, ascending, report_controls):
         with st.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", wrap=False):
             pivot_order = st.selectbox("Pivot order", pivot_orders, index=pivot_orders.index(("Category", "Vendor", "Store")), format_func=lambda order: " \u2192 ".join(order), key="pivot_order", width=360, label_visibility="collapsed")
             download_toolbar = st.container(horizontal=True, width="content", wrap=False)
+    st.caption("Sold qty: Days since sale; selected period.  |  Inward qty age panel: Current stock; days since original inward (not period receipts).")
     export = render_hierarchy_table(df, meta, state, sort_field, ascending, pivot_order)
+    # Deferred downloads run in a worker without Streamlit's session context.
+    # Share a plain holder so table-only reruns can update the current snapshot.
+    download_snapshot = {"frame": export}
+    st.session_state.report_export_holder = download_snapshot
     with download_toolbar:
         filename = f"inventory_report_{meta['start_date']}_{meta['end_date']}"
-        st.download_button("CSV", lambda: st.session_state.current_report_export.to_csv(index=False, float_format="%.2f").encode("utf-8-sig"), filename + ".csv", "text/csv", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
-        st.download_button("PDF", lambda: report_pdf(st.session_state.current_report_export, meta["start_date"], meta["end_date"], view, {}, table_only=True), filename + ".pdf", "application/pdf", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
+        st.download_button("CSV", lambda: download_snapshot["frame"].to_csv(index=False, float_format="%.2f").encode("utf-8-sig"), filename + ".csv", "text/csv", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
+        st.download_button("PDF", lambda: report_pdf(download_snapshot["frame"], meta["start_date"], meta["end_date"], view, {}, table_only=True), filename + ".pdf", "application/pdf", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
 
 
 AGE_BANDS = ["0–90", "91–180", "181–270", "271–360", ">360"]
@@ -2289,53 +2368,55 @@ def quantity_age_summary(frame, age_column, quantity_column):
 
 
 def inline_quantity_age_html(scope, meta, kind):
-    """Render all age boxes from the report's preloaded additive totals."""
-    try:
-        if f"age_{kind}_0" not in scope:
-            return '<div class="quantity-age-body">Click Apply in the date filter once to load age quantities.</div>'
-        qty_columns = [f"age_{kind}_{index}" for index in range(5)]
-        summary = pd.DataFrame({"Age band": AGE_BANDS,
-                                "Quantity": [scope[column].sum() if column in scope else 0.0 for column in qty_columns]})
-        caption = ("Days since sale; selected period" if kind == "sales" else
-                   "Current stock; days since original inward (not period receipts)")
-        markup = ['<div class="quantity-age-body">', f'<div>{safe_html(caption)}</div>',
-                  '<div class="quantity-age-boxes" style="display:flex;flex-wrap:nowrap;gap:4px;margin-top:6px;">']
-        for _, row in summary.iterrows():
-            markup.append(f'<div style="background:{AGE_COLORS[row["Age band"]]};color:#111827;border:1px solid #9ca3af;border-radius:3px;padding:5px 7px;text-align:center;white-space:nowrap;min-width:54px;">'
-                          f'<div style="font-size:11px;">{safe_html(row["Age band"])} days</div>'
-                          f'<div style="font-size:15px;font-weight:700;">{row["Quantity"]:,.2f}</div></div>')
-        markup.append('</div>')
-        unknown_column = f"age_{kind}_unknown"
-        unknown = scope[unknown_column].sum() if unknown_column in scope else 0
-        if unknown:
-            markup.append(f'<div>Unknown / future dates: qty {unknown:,.2f}</div>')
-        markup.append('</div>')
-        return "".join(markup)
-    except Exception as error:
-        return f'<div class="quantity-age-body">Unable to load age bands: {safe_html(str(error))}</div>'
+    """Send compact totals; create the five boxes only when opened in the browser."""
+    if f"age_{kind}_0" not in scope:
+        return '<div class="quantity-age-body">Click Apply in the date filter once to load age quantities.</div>'
+    quantities = [float(scope[f"age_{kind}_{index}"].sum()) for index in range(5)]
+    unknown = float(scope[f"age_{kind}_unknown"].sum())
+    caption = "Days since sale; selected period" if kind == "sales" else "Current stock; days since original inward (not period receipts)"
+    return (f'<div class="quantity-age-body" data-quantities="{safe_html(json.dumps(quantities))}" '
+            f'data-unknown="{unknown}" data-caption="{safe_html(caption)}"></div>')
+
+
+def quantity_age_query(kind, meta, reference):
+    """Summarize in SQL without image joins, lot allocation, or detail downloads."""
+    product = PRODUCT_BASE[:PRODUCT_BASE.index(",\nproduct_images AS (")]
+    if kind == "sales":
+        ctes = SALES_SQL[SALES_SQL.index(",\npos_sales AS ("):SALES_SQL.index(",\nlot_moves AS (")]
+        source = "pos_sales s LEFT JOIN product_base p ON s.product_id = p.product_id"
+        company, vendor, category = "s.company", "p.vendor", "p.category"
+        date_column, qty = "s.sold_date", "s.sale_qty"
+        params = [meta["start_date"].isoformat(), meta["end_date"].isoformat()]
+        condition = "1 = 1"
+    else:
+        ctes = AVAILABLE_SQL[AVAILABLE_SQL.index(",\nstock_min_date AS ("):AVAILABLE_SQL.index("\nSELECT\n    i.company,")]
+        source = "inventory_detail i"
+        company, vendor, category = "i.company", "i.vendor", "i.category"
+        date_column, qty = "i.stock_move_date", "i.available_inventory"
+        params = []
+        condition = "i.available_inventory <> 0"
+    age = f"DATEDIFF(DAY, {date_column}, ref.age_reference)"
+    expressions = []
+    for index, (lower, upper) in enumerate([(0, 90), (91, 180), (181, 270), (271, 360), (361, None)]):
+        bounds = f"{age} >= {lower}" if upper is None else f"{age} BETWEEN {lower} AND {upper}"
+        expressions.append(f"SUM(CASE WHEN {bounds} THEN {qty} ELSE 0 END) AS age_{kind}_{index}")
+    expressions.append(f"SUM(CASE WHEN {date_column} IS NULL OR {age} < 0 THEN {qty} ELSE 0 END) AS age_{kind}_unknown")
+    sql = (product + ctes + f"\nSELECT {company} AS company_id_name, {vendor} AS Vendor, {category} AS categ_id_name,\n"
+           + ",\n".join(expressions) + f"\nFROM {source} CROSS JOIN (SELECT CAST(? AS DATE) AS age_reference) ref"
+           + f"\nWHERE {condition} GROUP BY {company}, {vendor}, {category}")
+    return sql, params + [reference.isoformat()]
 
 
 def preload_quantity_ages(raw, meta):
-    """Fetch once with the report, retaining only small additive age totals."""
+    """Download only one small age-summary row per store/vendor/category."""
     result = raw.copy()
     keys = ["company_id_name", "Vendor", "categ_id_name"]
+    conn_str = build_connection_string(SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID)
     for kind in ("sales", "available"):
-        detail = quantity_age_details(raw, meta, kind)
-        date_column = "sold_date" if kind == "sales" else "stock_move_date"
-        qty = "sale_qty" if kind == "sales" else "available_inventory"
-        ages = (pd.Timestamp(business_today()) - pd.to_datetime(detail[date_column], errors="coerce")).dt.days
-        bands = pd.cut(ages, [-1, 90, 180, 270, 360, float("inf")], labels=False)
-        bands = bands.where(ages.ge(0))
-        columns = []
-        for index in range(5):
-            column = f"age_{kind}_{index}"
-            detail[column] = pd.to_numeric(detail[qty], errors="coerce").fillna(0).where(bands.eq(index), 0)
-            columns.append(column)
-        column = f"age_{kind}_unknown"
-        detail[column] = pd.to_numeric(detail[qty], errors="coerce").fillna(0).where(bands.isna(), 0)
-        columns.append(column)
-        totals = detail.rename(columns={"company": keys[0], "vendor": keys[1], "category": keys[2]}).groupby(keys, dropna=False, as_index=False)[columns].sum()
-        result = result.merge(totals, on=keys, how="left", validate="one_to_one")
+        sql, params = quantity_age_query(kind, meta, business_today())
+        totals = run_query(conn_str, sql, params)
+        columns = [f"age_{kind}_{index}" for index in [0, 1, 2, 3, 4, "unknown"]]
+        result = result.merge(totals[keys + columns], on=keys, how="left", validate="one_to_one")
         result[columns] = result[columns].fillna(0)
     return result
 
