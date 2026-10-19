@@ -462,7 +462,7 @@ st.markdown(
     }
 
     html, body, .stApp {
-        font-family: inherit;
+        font-family: sans-serif;
     }
 
     .stApp {
@@ -911,6 +911,11 @@ st.markdown(
     }
 
     /* Prashanti Sarees palette; preserve Streamlit's default font. */
+    [data-testid="stMultiSelect"] div:has(> [data-testid="stMultiSelectTagsContainer"]) {
+        background: #ffffff !important;
+        border-color: #d4c3e1 !important;
+        color: #202124 !important;
+    }
     [data-testid="stMultiSelect"] button,
     [data-testid="stMultiSelect"] [role="combobox"] {
         background: #ffffff !important;
@@ -2067,13 +2072,15 @@ _HIERARCHY_COMPONENT = st.components.v2.component(
     js="""
 export default function({data, parentElement, setStateValue}) {
     const root = parentElement.querySelector('.hierarchy-root');
+    const ageOpened = new Set([...root.querySelectorAll('.quantity-age-toggle[open]')].map(node => node.id));
     root.innerHTML = data.html;
     const opened = new Set(data.opened);
     const nodes = [...root.querySelectorAll('details')];
-    nodes.forEach(node => { node.open = opened.has(node.id); });
+    nodes.forEach(node => { node.open = opened.has(node.id) || ageOpened.has(node.id); });
     nodes.forEach(node => {
         node.ontoggle = () => {
-            const next = nodes.filter(item => item.open).map(item => item.id);
+            if (node.classList.contains('quantity-age-toggle')) return;
+            const next = nodes.filter(item => item.open && !item.classList.contains('quantity-age-toggle')).map(item => item.id);
             if (JSON.stringify([...opened].sort()) !== JSON.stringify([...next].sort())) {
                 setStateValue('opened', next);
             }
@@ -2085,6 +2092,7 @@ export default function({data, parentElement, setStateValue}) {
 )
 
 
+@st.fragment
 def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_order=("Category", "Vendor", "Store")):
     dimensions = {"Store": ["company_id_name"], "Vendor": ["Vendor"],
                   "Category": ["master_category", "categ_id_name"]}
@@ -2100,11 +2108,11 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
            ".pivot-hierarchy summary {cursor:pointer;} "
            ".pivot-hierarchy .master-row,.pivot-hierarchy .grand-total {font-weight:700;} "
            ".pivot-hierarchy .grand-total td {border-bottom:2px solid #dddddd;} "]
-    markup = ['<div class="report-table-wrap"><table class="report-table pivot-hierarchy"><thead><tr>']
+    markup = ['<div class="report-table-wrap"><table class="report-table pivot-hierarchy" style="table-layout:fixed;width:1450px;min-width:1450px"><colgroup><col style="width:360px">' + '<col style="width:181px">' * 6 + '</colgroup><thead><tr>']
     markup.extend(f"<th>{safe_html(header)}</th>" for header in headers)
     markup.append("</tr></thead><tbody>")
 
-    def add_row(label, totals, classes, depth=0, toggle_id=None, visible=True):
+    def add_row(label, totals, classes, depth=0, toggle_id=None, visible=True, scope=None, row_id="total"):
         if visible:
             visible_rows.append(["    " * depth + str(label)] + [float(totals[metric]) for metric in METRICS])
         markup.append(f'<tr class="{classes}"><td class="tree-cell" style="padding-left:{13 + depth * 22}px">')
@@ -2116,10 +2124,19 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
         markup.append("</td>")
         for metric in METRICS:
             prefix = "₹" if metric.endswith("value") else ""
-            markup.append(f"<td>{prefix}{float(totals[metric]):,.2f}</td>")
+            if metric in {"sale_qty", "inward_qty"}:
+                kind = "sales" if metric == "sale_qty" else "available"
+                age_id = f"age-{kind}-{row_id}"
+                markup.append(f'<td><details id="{age_id}" class="quantity-age-toggle"><summary title="Expand age bands">{float(totals[metric]):,.2f}</summary>')
+                markup.append(inline_quantity_age_html(scope, meta, kind))
+                markup.append("</details></td>")
+            else:
+                markup.append(f"<td>{prefix}{float(totals[metric]):,.2f}</td>")
         markup.append("</tr>")
 
-    add_row("Grand total", frame[METRICS].sum(), "grand-total")
+    css.append(".quantity-age-toggle {min-width:110px;position:relative;} .quantity-age-toggle>summary {white-space:nowrap;} "
+               ".quantity-age-body {width:100%;overflow-x:auto;padding:8px 0;white-space:normal;font-weight:400;}")
+    add_row("Grand total", frame[METRICS].sum(), "grand-total", scope=frame)
     def render_level(group, depth, ancestors, path):
         key = levels[depth]
         grouped = aggregate_report(group, [key])
@@ -2139,7 +2156,7 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
                 css.append(f"{selector} .{row_class} {{display:table-row;}}")
             leaf = depth == len(levels) - 1
             label = value if pd.notna(value) else "(No vendor)" if key == "Vendor" else "(Not recorded)"
-            add_row(label, record, classes, depth, None if leaf else toggle_id, all(ancestor in opened for ancestor in ancestors))
+            add_row(label, record, classes, depth, None if leaf else toggle_id, all(ancestor in opened for ancestor in ancestors), subset, node_suffix)
             if not leaf:
                 render_level(subset, depth + 1, ancestors + (toggle_id,), node)
     render_level(frame, 0, (), ())
@@ -2147,7 +2164,9 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
     table_html = "<style>" + "".join(css) + "</style>" + "".join(markup)
     _HIERARCHY_COMPONENT(data={"html": table_html, "opened": opened}, key=component_key,
                          default={"opened": []}, on_opened_change=lambda: None)
-    return pd.DataFrame(visible_rows, columns=headers)
+    export = pd.DataFrame(visible_rows, columns=headers)
+    st.session_state.current_report_export = export
+    return export
 
 
 def render_main_report():
@@ -2168,11 +2187,10 @@ def render_main_report():
     def cancel_dates():
         reset_date_draft()
         st.session_state.date_preset = "Custom range"
-    title_area, date_area = st.columns([3, 2], vertical_alignment="center")
-    with title_area:
-        st.markdown("### Inventory purchase report")
+    st.markdown("### Inventory purchase report")
+    date_area, report_controls = st.columns([2, 4], vertical_alignment="center", wrap=False)
     with date_area:
-        with st.container(horizontal=True, horizontal_alignment="right"):
+        with st.container(horizontal=True, horizontal_alignment="left"):
             applied_start, applied_end = st.session_state.applied_dates
             date_label = f"{applied_start:%d %b %Y} – {applied_end:%d %b %Y}"
             with st.popover(date_label, icon=":material/calendar_month:"):
@@ -2182,33 +2200,21 @@ def render_main_report():
                                             max_value=today, key="custom_dates", format="DD/MM/YYYY")
                 else:
                     pending = date_bounds(preset, today)
-                    st.caption(f"{pending[0]:%d %b %Y} – {pending[1]:%d %b %Y}")
                 with st.container(horizontal=True):
                     apply = st.button("Apply", type="primary", disabled=len(pending) != 2)
                     st.button("Cancel", on_click=cancel_dates)
-                fetch_clicked = st.button("Fetch data")
-                refresh = st.button("Refresh applied range")
-                with st.expander("Cache options"):
-                    clear_clicked = st.button("Clear data and image cache")
     start_date, end_date = st.session_state.applied_dates
     if apply and len(pending) == 2:
         start_date, end_date = pending
-    run_clicked = apply or fetch_clicked or refresh
-    if refresh or clear_clicked:
-        get_aggregate_data.clear()
-        run_query.clear()
-    if clear_clicked:
-        load_image_cached.clear()
-        get_connection.clear()
-        st.session_state.pop("raw_df", None)
-        st.session_state.pop("raw_meta", None)
-    auto_restore = not clear_clicked and "raw_df" not in st.session_state and bool(qp.get("r_start"))
-    if (run_clicked or auto_restore) and connection_is_configured():
+    auto_restore = "raw_df" not in st.session_state and bool(qp.get("r_start"))
+    if (apply or auto_restore) and connection_is_configured():
         with st.spinner("Loading report..."):
             try:
                 conn_str = build_connection_string(SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID)
                 t0 = time.time()
                 raw = get_aggregate_data(conn_str, start_date.isoformat(), end_date.isoformat())
+                age_meta = dict(start_date=start_date, end_date=end_date)
+                raw = preload_quantity_ages(raw, age_meta)
                 st.session_state.raw_df = raw
                 st.session_state.raw_meta = dict(start_date=start_date, end_date=end_date,
                                                 fetched_at=datetime.now(), elapsed=time.time() - t0)
@@ -2243,24 +2249,110 @@ def render_main_report():
     df = raw[mask]
     if df.empty:
         st.info("No rows match these filters.")
-        return
-    render_report_section(df, meta, sort_field, ascending)
+    render_report_section(df, meta, sort_field, ascending, report_controls)
 
 
-@st.fragment
-def render_report_section(df, meta, sort_field, ascending):
-    """Keep hierarchy toggles and visible-row exports within one partial rerun."""
+def render_report_section(df, meta, sort_field, ascending, report_controls):
+    """Render controls alongside the date filter and the table beneath them."""
     view = "Category hierarchy"
-    download_toolbar = st.container(horizontal=True, horizontal_alignment="right")
     state = {}
     pivot_orders = [order for count in (1, 2, 3) for order in permutations(("Store", "Vendor", "Category"), count)]
-    with st.container(horizontal=True, horizontal_alignment="right"):
-        pivot_order = st.selectbox("Pivot order", pivot_orders, index=pivot_orders.index(("Category", "Vendor", "Store")), format_func=lambda order: " \u2192 ".join(order), key="pivot_order", width=360)
+    with report_controls:
+        with st.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", wrap=False):
+            pivot_order = st.selectbox("Pivot order", pivot_orders, index=pivot_orders.index(("Category", "Vendor", "Store")), format_func=lambda order: " \u2192 ".join(order), key="pivot_order", width=360, label_visibility="collapsed")
+            download_toolbar = st.container(horizontal=True, width="content", wrap=False)
     export = render_hierarchy_table(df, meta, state, sort_field, ascending, pivot_order)
     with download_toolbar:
         filename = f"inventory_report_{meta['start_date']}_{meta['end_date']}"
-        st.download_button("CSV", export.to_csv(index=False, float_format="%.2f").encode("utf-8-sig"), filename + ".csv", "text/csv", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
-        st.download_button("PDF", lambda: report_pdf(export, meta["start_date"], meta["end_date"], view, {}, table_only=True), filename + ".pdf", "application/pdf", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
+        st.download_button("CSV", lambda: st.session_state.current_report_export.to_csv(index=False, float_format="%.2f").encode("utf-8-sig"), filename + ".csv", "text/csv", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
+        st.download_button("PDF", lambda: report_pdf(st.session_state.current_report_export, meta["start_date"], meta["end_date"], view, {}, table_only=True), filename + ".pdf", "application/pdf", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
+
+
+AGE_BANDS = ["0–90", "91–180", "181–270", "271–360", ">360"]
+AGE_COLORS = dict(zip(AGE_BANDS, ["#dcfce7", "#dbeafe", "#fef9c3", "#ffedd5", "#fee2e2"]))
+
+
+def quantity_age_summary(frame, age_column, quantity_column):
+    """Bucket detail rows before consolidation; count distinct product/lot pairs."""
+    detail = frame.copy()
+    ages = pd.to_numeric(detail[age_column], errors="coerce")
+    detail["Age band"] = pd.cut(ages, [-1, 90, 180, 270, 360, float("inf")], labels=AGE_BANDS)
+    detail.loc[ages.lt(0), "Age band"] = pd.NA
+    rows = []
+    for band in AGE_BANDS:
+        group = detail[detail["Age band"].eq(band)]
+        lots = group[group.lot_number.notna() & ~group.lot_number.isin(["", "False", "No lot recorded"])]
+        rows.append({"Age band": band, "Products": group.product_id.nunique(),
+                     "Lots": len(lots[["product_id", "lot_number"]].drop_duplicates()),
+                     "Quantity": pd.to_numeric(group[quantity_column], errors="coerce").sum()})
+    return detail, pd.DataFrame(rows)
+
+
+def inline_quantity_age_html(scope, meta, kind):
+    """Render all age boxes from the report's preloaded additive totals."""
+    try:
+        if f"age_{kind}_0" not in scope:
+            return '<div class="quantity-age-body">Click Apply in the date filter once to load age quantities.</div>'
+        qty_columns = [f"age_{kind}_{index}" for index in range(5)]
+        summary = pd.DataFrame({"Age band": AGE_BANDS,
+                                "Quantity": [scope[column].sum() if column in scope else 0.0 for column in qty_columns]})
+        caption = ("Days since sale; selected period" if kind == "sales" else
+                   "Current stock; days since original inward (not period receipts)")
+        markup = ['<div class="quantity-age-body">', f'<div>{safe_html(caption)}</div>',
+                  '<div class="quantity-age-boxes" style="display:flex;flex-wrap:nowrap;gap:4px;margin-top:6px;">']
+        for _, row in summary.iterrows():
+            markup.append(f'<div style="background:{AGE_COLORS[row["Age band"]]};color:#111827;border:1px solid #9ca3af;border-radius:3px;padding:5px 7px;text-align:center;white-space:nowrap;min-width:54px;">'
+                          f'<div style="font-size:11px;">{safe_html(row["Age band"])} days</div>'
+                          f'<div style="font-size:15px;font-weight:700;">{row["Quantity"]:,.2f}</div></div>')
+        markup.append('</div>')
+        unknown_column = f"age_{kind}_unknown"
+        unknown = scope[unknown_column].sum() if unknown_column in scope else 0
+        if unknown:
+            markup.append(f'<div>Unknown / future dates: qty {unknown:,.2f}</div>')
+        markup.append('</div>')
+        return "".join(markup)
+    except Exception as error:
+        return f'<div class="quantity-age-body">Unable to load age bands: {safe_html(str(error))}</div>'
+
+
+def preload_quantity_ages(raw, meta):
+    """Fetch once with the report, retaining only small additive age totals."""
+    result = raw.copy()
+    keys = ["company_id_name", "Vendor", "categ_id_name"]
+    for kind in ("sales", "available"):
+        detail = quantity_age_details(raw, meta, kind)
+        date_column = "sold_date" if kind == "sales" else "stock_move_date"
+        qty = "sale_qty" if kind == "sales" else "available_inventory"
+        ages = (pd.Timestamp(business_today()) - pd.to_datetime(detail[date_column], errors="coerce")).dt.days
+        bands = pd.cut(ages, [-1, 90, 180, 270, 360, float("inf")], labels=False)
+        bands = bands.where(ages.ge(0))
+        columns = []
+        for index in range(5):
+            column = f"age_{kind}_{index}"
+            detail[column] = pd.to_numeric(detail[qty], errors="coerce").fillna(0).where(bands.eq(index), 0)
+            columns.append(column)
+        column = f"age_{kind}_unknown"
+        detail[column] = pd.to_numeric(detail[qty], errors="coerce").fillna(0).where(bands.isna(), 0)
+        columns.append(column)
+        totals = detail.rename(columns={"company": keys[0], "vendor": keys[1], "category": keys[2]}).groupby(keys, dropna=False, as_index=False)[columns].sum()
+        result = result.merge(totals, on=keys, how="left", validate="one_to_one")
+        result[columns] = result[columns].fillna(0)
+    return result
+
+
+def quantity_age_details(scope, meta, kind):
+    qp = {"scope": "group", "start_date": meta["start_date"].isoformat(), "end_date": meta["end_date"].isoformat(),
+          "d_companies": _encode_list(scope_values(scope, "company_id_name", "(No store)")),
+          "d_vendors": _encode_list(scope_values(scope, "Vendor", NONE_VENDOR_LABEL)),
+          "d_categories": _encode_list(scope_values(scope, "categ_id_name", "(No category)"))}
+    sql, params = drill_query(kind, qp)
+    conn_str = build_connection_string(SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID)
+    detail = run_query(conn_str, sql, params)
+    # Preserve exact selected combinations, rather than the cross product of scope lists.
+    keys = scope[["company_id_name", "Vendor", "categ_id_name"]].drop_duplicates().rename(
+        columns={"company_id_name": "company", "Vendor": "vendor", "categ_id_name": "category"})
+    detail = detail.merge(keys, on=["company", "vendor", "category"], how="inner")
+    return detail
 
 
 def drill_query(kind, qp):
