@@ -1542,7 +1542,9 @@ ORDER BY
     i.lot_number;
 """
 
-SALES_SQL = PRODUCT_BASE + """
+STOCK_RECEIPT_CTE = AVAILABLE_SQL[AVAILABLE_SQL.index(",\nstock_min_date AS ("):AVAILABLE_SQL.index(",\ninventory_detail AS (")]
+
+SALES_SQL = PRODUCT_BASE + STOCK_RECEIPT_CTE + """
 ,
 pos_sales AS (
     SELECT
@@ -1632,12 +1634,16 @@ SELECT
     s.lot_number,
     s.location,
     s.sold_date,
+    smd.stock_move_date,
     s.sale_qty,
     s.sale_value,
     COALESCE(pi.image_1920, '') AS image_1920
 FROM sales_detail s
 LEFT JOIN product_base p
     ON s.product_id = p.product_id
+LEFT JOIN stock_min_date smd
+    ON s.product_id = smd.product_id
+   AND s.lot_number = smd.lot_number
 LEFT JOIN product_images pi
     ON s.product_id = pi.product_id
 WHERE ( (? = '' AND s.company IS NULL)  OR s.company  = ? )
@@ -1863,7 +1869,7 @@ def render_sales_card(row):
         _detail_row("Lot No.", safe_html(row.get("lot_number", ""))),
         _detail_row("Location", safe_html(row.get("location", ""))),
         _detail_row("Latest sold date", safe_html(row.get("sold_date", ""))),
-        _detail_row("Days since sale", safe_html(row.get("sale_age", ""))),
+        _detail_row("Days from inward to sale", safe_html(row.get("sale_age", ""))),
         _detail_row("Sale value", f"₹{sale_value:,.0f}"),
         '<div class="price-row">'
         f'<span class="price">₹{sp:,.0f}</span>'
@@ -2130,7 +2136,7 @@ export default function({data, parentElement, setStateValue}) {
                         if (Number(body.dataset.unknown)) {
                             const unknown = document.createElement('div');
                             unknown.textContent = 'Age unavailable: qty ' + Number(body.dataset.unknown).toLocaleString('en-IN', {maximumFractionDigits:0});
-                            unknown.title = 'The inward or sale date is missing, or is later than the age reference date. These quantities are excluded from the five age bands.';
+                            unknown.title = 'The inward date is missing, the sale precedes inward, or the current-stock inward date is in the future. These quantities are excluded from the five age bands.';
                             body.append(unknown);
                         }
                     }
@@ -2335,7 +2341,7 @@ def render_report_section(df, meta, sort_field, ascending, report_controls):
         with st.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", wrap=False):
             pivot_order = st.selectbox("Pivot order", pivot_orders, index=pivot_orders.index(("Category", "Vendor", "Store")), format_func=lambda order: " \u2192 ".join(order), key="pivot_order", width=360, label_visibility="collapsed")
             download_toolbar = st.container(horizontal=True, width="content", wrap=False)
-    st.caption("Sold qty: Days since sale; selected period.  |  Inward qty age panel: Current stock; days since original inward (not period receipts).")
+    st.caption("Sold qty: Days from original inward to sale; selected period.  |  Inward qty age panel: Current stock; days since original inward (not period receipts).")
     export = render_hierarchy_table(df, meta, state, sort_field, ascending, pivot_order)
     # Deferred downloads run in a worker without Streamlit's session context.
     # Share a plain holder so table-only reruns can update the current snapshot.
@@ -2373,19 +2379,23 @@ def inline_quantity_age_html(scope, meta, kind):
         return '<div class="quantity-age-body">Click Apply in the date filter once to load age quantities.</div>'
     quantities = [float(scope[f"age_{kind}_{index}"].sum()) for index in range(5)]
     unknown = float(scope[f"age_{kind}_unknown"].sum())
-    caption = "Days since sale; selected period" if kind == "sales" else "Current stock; days since original inward (not period receipts)"
+    caption = "Days from original inward to sale; selected period" if kind == "sales" else "Current stock; days since original inward (not period receipts)"
     return (f'<div class="quantity-age-body" data-quantities="{safe_html(json.dumps(quantities))}" '
             f'data-unknown="{unknown}" data-caption="{safe_html(caption)}"></div>')
 
 
 def quantity_age_query(kind, meta, reference):
-    """Summarize in SQL without image joins, lot allocation, or detail downloads."""
+    """Summarize in SQL; sold age follows the receipt of the actual sold lot."""
     product = PRODUCT_BASE[:PRODUCT_BASE.index(",\nproduct_images AS (")]
     if kind == "sales":
-        ctes = SALES_SQL[SALES_SQL.index(",\npos_sales AS ("):SALES_SQL.index(",\nlot_moves AS (")]
-        source = "pos_sales s LEFT JOIN product_base p ON s.product_id = p.product_id"
+        ctes = SALES_SQL[SALES_SQL.index(",\npos_sales AS ("):SALES_SQL.index("\nSELECT\n    s.company,")]
+        ctes += AVAILABLE_SQL[AVAILABLE_SQL.index(",\nstock_min_date AS ("):AVAILABLE_SQL.index(",\ninventory_detail AS (")]
+        source = ("sales_detail s LEFT JOIN product_base p ON s.product_id = p.product_id "
+                  "LEFT JOIN stock_min_date smd ON s.product_id = smd.product_id AND s.lot_number = smd.lot_number")
         company, vendor, category = "s.company", "p.vendor", "p.category"
-        date_column, qty = "s.sold_date", "s.sale_qty"
+        date_column, qty = "smd.stock_move_date", "s.sale_qty"
+        age = "DATEDIFF(DAY, smd.stock_move_date, s.sold_date)"
+        reference_join = ""
         params = [meta["start_date"].isoformat(), meta["end_date"].isoformat()]
         condition = "1 = 1"
     else:
@@ -2395,16 +2405,18 @@ def quantity_age_query(kind, meta, reference):
         date_column, qty = "i.stock_move_date", "i.available_inventory"
         params = []
         condition = "i.available_inventory <> 0"
-    age = f"DATEDIFF(DAY, {date_column}, ref.age_reference)"
+        age = f"DATEDIFF(DAY, {date_column}, ref.age_reference)"
+        reference_join = " CROSS JOIN (SELECT CAST(? AS DATE) AS age_reference) ref"
+        params.append(reference.isoformat())
     expressions = []
     for index, (lower, upper) in enumerate([(0, 90), (91, 180), (181, 270), (271, 360), (361, None)]):
         bounds = f"{age} >= {lower}" if upper is None else f"{age} BETWEEN {lower} AND {upper}"
         expressions.append(f"SUM(CASE WHEN {bounds} THEN {qty} ELSE 0 END) AS age_{kind}_{index}")
     expressions.append(f"SUM(CASE WHEN {date_column} IS NULL OR {age} < 0 THEN {qty} ELSE 0 END) AS age_{kind}_unknown")
     sql = (product + ctes + f"\nSELECT {company} AS company_id_name, {vendor} AS Vendor, {category} AS categ_id_name,\n"
-           + ",\n".join(expressions) + f"\nFROM {source} CROSS JOIN (SELECT CAST(? AS DATE) AS age_reference) ref"
+           + ",\n".join(expressions) + f"\nFROM {source}" + reference_join
            + f"\nWHERE {condition} GROUP BY {company}, {vendor}, {category}")
-    return sql, params + [reference.isoformat()]
+    return sql, params
 
 
 def preload_quantity_ages(raw, meta):
@@ -2491,12 +2503,9 @@ def render_drillthrough(qp):
         frame = frame[selected_mask(frame, column, selected, null_label)]
     age_column = "sale_age" if kind == "sales" else "overall_age"
     if kind == "sales":
-        reference_name = st.sidebar.selectbox("Days since sale reference", ["Today", "Report end date"])
-        reference = business_today() if reference_name == "Today" else end
         frame = frame.copy()
         frame["sold_date"] = pd.to_datetime(frame["sold_date"], errors="coerce")
-        frame[age_column] = (pd.Timestamp(reference) - frame.sold_date).dt.days
-        frame.attrs["age_reference"] = reference
+        frame[age_column] = (frame.sold_date - pd.to_datetime(frame.stock_move_date, errors="coerce")).dt.days
     else:
         frame = frame.copy()
         # Recompute after cached queries so age cannot become stale at midnight.
@@ -2516,14 +2525,14 @@ def render_drillthrough(qp):
         return
     consolidated = st.toggle("Combine lots and stores into one card per product", value=True)
     display = consolidate_products(frame, kind) if consolidated else frame.copy()
-    st.caption("Combined stock age is the oldest receipt age; combined sold date is the latest sale. Age filters apply to the underlying detail rows before totals are combined.")
+    st.caption("Combined stock age is the oldest receipt age; combined sold age is the longest time from inward to sale. Age filters apply to the underlying detail rows before totals are combined.")
     qty = "sale_qty" if kind == "sales" else "available_inventory"
     value = "sale_value" if kind == "sales" else "available_selling_price"
     a, b, c = st.columns(3)
     a.metric("Products", f"{frame.product_id.nunique():,}")
     b.metric("Sold quantity" if kind == "sales" else "Available quantity", f"{frame[qty].sum():,.2f}")
     c.metric("Sales value" if kind == "sales" else "Available value", f"₹{frame[value].sum():,.2f}")
-    sort_labels = {age_column: "Days since sale" if kind == "sales" else "Stock age (days)", value: "Sales value" if kind == "sales" else "Available value", qty: "Sold quantity" if kind == "sales" else "Available quantity", "product_name": "Product name", "sku": "SKU"}
+    sort_labels = {age_column: "Days from inward to sale" if kind == "sales" else "Stock age (days)", value: "Sales value" if kind == "sales" else "Available value", qty: "Sold quantity" if kind == "sales" else "Available quantity", "product_name": "Product name", "sku": "SKU"}
     if kind == "sales":
         sort_labels["sold_date"] = "Sold date"
     controls = st.columns([3, 1, 1])
