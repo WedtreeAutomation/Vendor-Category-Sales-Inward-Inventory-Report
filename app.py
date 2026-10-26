@@ -84,7 +84,7 @@ from azure.identity import ClientSecretCredential
 from azure.storage.filedatalake import DataLakeServiceClient
 
 # Report transformations and exports live in this file.
-METRICS = ["sale_qty", "sale_value", "available_qty", "available_value", "inward_qty", "inward_value"]
+METRICS = ["sale_qty", "sale_value", "available_qty", "available_value", "inward_qty", "inward_value", "intransit_qty", "intransit_value", "outgoing_qty", "outgoing_value", "returns_qty", "returns_value"]
 DATE_PRESETS = ["Today", "Yesterday", "Last 7 days", "Last 30 days", "Week to date", "Month to date", "Quarter to date", "Year to date", "Custom range"]
 
 
@@ -229,7 +229,10 @@ LABELS = {"master_category": "Master category", "categ_id_name": "Category",
           "Vendor": "Vendor", "company_id_name": "Store", "sale_qty": "Sold quantity",
           "sale_value": "Sales value (INR)", "available_qty": "Available quantity",
           "available_value": "Available value (INR)", "inward_qty": "Inward quantity",
-          "inward_value": "Inward value (INR)"}
+          "inward_value": "Inward value (INR)",
+          "intransit_qty": "Intransit quantity", "intransit_value": "Intransit value (INR)",
+          "outgoing_qty": "Outgoing quantity", "outgoing_value": "Outgoing value (INR)",
+          "returns_qty": "Returns quantity", "returns_value": "Returns value (INR)"}
 
 
 def report_export_frame(frame, view, sort_field, ascending, pivot_metric="sale_qty", pivot_order=None):
@@ -275,7 +278,7 @@ def report_pdf(frame, start, end, view, filters, measure=None, table_only=False,
         content.append(Paragraph(escape(f"Measure: {measure}"), styles["Normal"]))
     for label, values in filters.items():
         content.append(Paragraph(escape(f"{label}: {', '.join(display_store_name(value) for value in values) if values else 'All'}"), styles["Normal"]))
-    content += [Paragraph("Sales and inward use the selected period. Available inventory is the current snapshot. Currency: INR.", styles["Normal"]), Spacer(1, 12)]
+    content += [Paragraph("Sales, inward, outgoing and returns use the selected period. Available and intransit are current snapshots. Currency: INR.", styles["Normal"]), Spacer(1, 12)]
     if table_only:
         content = []
     dimension_columns = [column for column in frame if not pd.api.types.is_numeric_dtype(frame[column])]
@@ -1080,6 +1083,53 @@ def run_query(conn_str, sql, params):
     return pd.DataFrame.from_records(rows, columns=columns)
 
 
+@st.cache_data(ttl=AGGREGATE_CACHE_TTL_SECONDS, max_entries=32, show_spinner=False)
+def run_isolated_report_query(conn_str, sql, params):
+    """Each cache miss owns its connection; concurrent workers never share ODBC objects."""
+    conn = pyodbc.connect(conn_str, autocommit=True)
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql, params)
+            columns = [column[0] for column in cursor.description]
+            return pd.DataFrame.from_records(cursor.fetchall(), columns=columns)
+        finally:
+            cursor.close()
+    finally:
+        conn.close()
+
+
+def load_report_parallel(conn_str, start, end, reference, _query_runner=None):
+    """Fetch the four independent summaries together, then join only in memory."""
+    runner = run_isolated_report_query if _query_runner is None else _query_runner
+    meta = dict(start_date=start, end_date=end)
+    queries = {"Report totals": build_query_and_params(start.isoformat(), end.isoformat()),
+               "Sold age": quantity_age_query("sales", meta, reference),
+               "Available age": quantity_age_query("available", meta, reference),
+               "Transfer ages": transfer_age_query(meta, reference)}
+    def fetch(name, query):
+        started = time.perf_counter()
+        try:
+            frame = runner(conn_str, query[0], query[1])
+        except Exception as error:
+            raise RuntimeError(f"{name} query failed: {error}") from error
+        return frame, time.perf_counter() - started
+    frames, timings = {}, {}
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="report-fetch") as pool:
+        futures = {name: pool.submit(fetch, name, query) for name, query in queries.items()}
+        for name, future in futures.items():
+            frames[name], timings[name] = future.result()
+    started = time.perf_counter()
+    result = frames.pop("Report totals").copy()
+    keys = ["company_id_name", "Vendor", "categ_id_name"]
+    for totals in frames.values():
+        columns = [column for column in totals if column.startswith("age_")]
+        result = result.merge(totals[keys + columns], on=keys, how="left", validate="one_to_one")
+        result[columns] = result[columns].fillna(0)
+    timings["Combine results"] = time.perf_counter() - started
+    return result, timings
+
+
 # =====================================================================
 # Image loading (OneLake / ADLS Gen2)
 # =====================================================================
@@ -1175,8 +1225,121 @@ def image_to_data_uri(img: Image.Image, fmt: str = "JPEG", quality: int = 82) ->
 # shape (and therefore the cache key) stable across filter tweaks.
 # =====================================================================
 
-QUERY_TEMPLATE = """
-WITH product_master AS (
+HO_COMPANY = "Wedtree eStore Private Limited - HO"
+STORE_COMPANIES = tuple("Wedtree eStore Private Limited - " + name for name in
+                        ("Coimbatore", "Hyderabad", "Jayanagar", "Malleshwaram", "T Nagar", "Vizag"))
+NETWORK_COMPANIES_SQL = ", ".join("'" + name + "'" for name in (HO_COMPANY,) + STORE_COMPANIES)
+# EXCLUDED_STOCK_LOCATIONS_SQL = "'Physical Locations/Subcontracting Location', 'Physical Locations/Inter-warehouse transit', 'Virtual Locations/Production'"
+EXCLUDED_STOCK_LOCATIONS_SQL = "'Physical Locations/Subcontractors','CBWH/Damage','HYDWH/Stock/Damage','JAYWH/Warehouse/Damage','MLMWH/warehouse/DAMAGE','TNWH/Warehouse/DAMAGE','HYD/Stock/CONSUMABLES','JYR/Stock/CONSUMABLE','MLM/Stock/CONSUMABLE','Prash/Stock/CONSUMABLE','TN/Stock/CONSUMABLE','VZG/Stock/CONSUMABLE'"
+
+def sql_relation_key(expression):
+    """Normalize the integer and [id, 'name'] relation encodings in the supplied SQL."""
+    value = f"CAST({expression} AS VARCHAR(MAX))"
+    return (f"CASE WHEN LEFT({value}, 1) = '[' THEN LTRIM(RTRIM(SUBSTRING({value}, 2, "
+            f"CHARINDEX(',', {value} + ',') - 2))) ELSE NULLIF(CAST({expression} AS VARCHAR(50)), 'False') END")
+
+
+PICKING_PARTNER_CTE = """,
+pk AS (
+    SELECT
+        sp.*,
+        CASE
+            WHEN CHARINDEX('''', CAST(sp.partner_id AS VARCHAR(MAX))) > 0
+             AND CHARINDEX(
+                    '''',
+                    CAST(sp.partner_id AS VARCHAR(MAX)),
+                    CHARINDEX('''', CAST(sp.partner_id AS VARCHAR(MAX))) + 1
+                 ) > CHARINDEX('''', CAST(sp.partner_id AS VARCHAR(MAX)))
+            THEN LTRIM(RTRIM(
+                SUBSTRING(
+                    CAST(sp.partner_id AS VARCHAR(MAX)),
+                    CHARINDEX('''', CAST(sp.partner_id AS VARCHAR(MAX))) + 1,
+                    CHARINDEX(
+                        '''',
+                        CAST(sp.partner_id AS VARCHAR(MAX)),
+                        CHARINDEX('''', CAST(sp.partner_id AS VARCHAR(MAX))) + 1
+                    ) - CHARINDEX('''', CAST(sp.partner_id AS VARCHAR(MAX))) - 1
+                )
+            ))
+            ELSE NULL
+        END AS partner_name
+    FROM WT_LH_Silver.Odoo.stock_picking sp
+)"""
+
+TRANSFER_CTES = PICKING_PARTNER_CTE + f""",
+normalized_move_lines AS (
+    SELECT ml.*,
+        {sql_relation_key('ml.picking_id')} AS picking_key,
+        {sql_relation_key('ml.product_id')} AS product_key
+    FROM WT_LH_Silver.Odoo.stock_move_line ml
+),
+transfer_facts AS (
+    -- Completed inbound receipts and ready inbound transfers: supplied PO-line formulas.
+    SELECT CAST(pk.id AS VARCHAR(50)) AS picking_id,
+        pk.company_id_name AS company,
+        CAST(pro.id AS VARCHAR(50)) AS product_id,
+        pro.categ_id_name AS category,
+        CASE WHEN pk.state = 'done' THEN 'inward' ELSE 'intransit' END AS kind,
+        CAST(pk.date_done AS DATE) AS event_date,
+        SUM(CASE WHEN pk.state = 'done' THEN pol.qty_received
+                 ELSE pol.product_qty - pol.qty_received END) AS quantity,
+        SUM((CASE WHEN pk.state = 'done' THEN pol.qty_received
+                  ELSE pol.product_qty - pol.qty_received END) * pro.lst_price) AS value
+    FROM pk
+    LEFT JOIN WT_LH_Silver.Odoo.purchase_order po ON pk.origin = po.name
+    LEFT JOIN WT_LH_Silver.Odoo.purchase_order_line pol ON po.id = pol.order_id
+    LEFT JOIN WT_LH_Silver.Odoo.product_product pro ON CAST(pol.product_id AS VARCHAR(50)) = CAST(pro.id AS VARCHAR(50))
+    CROSS JOIN report_dates d
+    WHERE pk.picking_type_code = 'incoming'
+      AND pk.state IN ('done', 'assigned')
+      AND pk.company_id_name IN ({NETWORK_COMPANIES_SQL})
+      AND pk.partner_name IN ({NETWORK_COMPANIES_SQL})
+      AND pk.partner_name <> pk.company_id_name
+      AND ((pk.state = 'done' AND CAST(pk.date_done AS DATE) BETWEEN d.start_date AND d.end_date)
+           OR (pk.state = 'assigned' AND pol.product_qty - pol.qty_received > 0))
+      AND LOWER(pro.categ_id_name) NOT LIKE '%admin%'
+    GROUP BY CAST(pk.id AS VARCHAR(50)), pk.company_id_name, CAST(pro.id AS VARCHAR(50)),
+             pro.categ_id_name, pk.state, CAST(pk.date_done AS DATE)
+    UNION ALL
+    -- Completed non-POS outgoing transfers: supplied delivered SO-line quantity.
+    SELECT CAST(pk.id AS VARCHAR(50)), pk.company_id_name, CAST(pro.id AS VARCHAR(50)),
+        pro.categ_id_name, 'outgoing', CAST(pk.date_done AS DATE),
+        SUM(sol.qty_delivered), SUM(sol.qty_delivered * pro.lst_price)
+    FROM pk
+    LEFT JOIN WT_LH_Silver.Odoo.sale_order so ON pk.origin = so.name
+    LEFT JOIN WT_LH_Silver.Odoo.sale_order_line sol ON so.id = sol.order_id
+    LEFT JOIN WT_LH_Silver.Odoo.product_product pro ON CAST(sol.product_id AS VARCHAR(50)) = CAST(pro.id AS VARCHAR(50))
+    CROSS JOIN report_dates d
+    WHERE pk.picking_type_code = 'outgoing' AND pk.state = 'done'
+      AND pk.name LIKE '%/OUT/%' AND UPPER(pk.name) NOT LIKE '%POS%'
+      AND pk.company_id_name IN ({NETWORK_COMPANIES_SQL})
+      AND pk.partner_name IN ({NETWORK_COMPANIES_SQL})
+      AND pk.partner_name <> pk.company_id_name
+      AND CAST(pk.date_done AS DATE) BETWEEN d.start_date AND d.end_date
+      AND LOWER(pro.categ_id_name) NOT LIKE '%admin%'
+    GROUP BY CAST(pk.id AS VARCHAR(50)), pk.company_id_name, CAST(pro.id AS VARCHAR(50)),
+             pro.categ_id_name, CAST(pk.date_done AS DATE)
+),
+return_facts AS (
+    SELECT pk.company_id_name AS company, CAST(pro.id AS VARCHAR(50)) AS product_id,
+        pro.categ_id_name AS category,
+        SUM(ml.quantity) AS quantity, SUM(ml.quantity * pro.lst_price) AS value
+    FROM pk
+    INNER JOIN normalized_move_lines ml ON ml.picking_key = CAST(pk.id AS VARCHAR(50)) AND ml.state = 'done'
+    LEFT JOIN WT_LH_Silver.Odoo.product_product pro ON ml.product_key = CAST(pro.id AS VARCHAR(50))
+    CROSS JOIN report_dates d
+    WHERE pk.picking_type_code = 'outgoing' AND pk.state = 'done'
+      AND pk.name LIKE '%/OUT/%' AND UPPER(pk.name) NOT LIKE '%POS%'
+      AND pk.company_id_name = '{HO_COMPANY}'
+      AND pk.location_dest_id_name = 'Partners/Vendors'
+      AND CAST(pk.date_done AS DATE) BETWEEN d.start_date AND d.end_date
+      AND LOWER(pro.categ_id_name) NOT LIKE '%admin%'
+    GROUP BY pk.company_id_name, CAST(pro.id AS VARCHAR(50)), pro.categ_id_name
+)
+"""
+
+QUERY_TEMPLATE = """WITH report_dates AS (SELECT CAST(? AS DATE) AS start_date, CAST(? AS DATE) AS end_date),
+product_master AS (
     SELECT
         CAST(p.id AS VARCHAR(50)) AS product_id,
         pt.vendor_id_name AS product_vendor,
@@ -1198,11 +1361,14 @@ sales_data AS (
     FROM WT_LH_Silver.Odoo.pos_order_line pol
     INNER JOIN WT_LH_Silver.Odoo.pos_order po
         ON CAST(po.id AS VARCHAR(50)) = CAST(pol.order_id AS VARCHAR(50))
-    WHERE CAST(po.date_order AS DATE) >= ?
-      AND CAST(po.date_order AS DATE) <= ?
+    CROSS JOIN report_dates d
+    WHERE CAST(po.date_order AS DATE) >= d.start_date
+      AND CAST(po.date_order AS DATE) <= d.end_date
       AND po.user_id_name <> 'Administrator'
       AND pol.company_id_name NOT IN (
             'Saree Trails',
+            'Wedtree Estore private Limited - Saree Trails',
+            'Wedtree eStore Private Limited - Online',
             'Wedtree eStore Private Limited - HO'
       )
       AND po.config_id_name NOT IN (
@@ -1225,115 +1391,67 @@ sales_summary AS (
     FROM sales_data sd
     LEFT JOIN product_master pm
         ON CAST(sd.product_id AS VARCHAR(50)) = pm.product_id
+    WHERE pm.category IS NOT NULL
+      AND LOWER(pm.category) NOT LIKE '%admin%'
     GROUP BY
         sd.company_id_name,
         pm.product_vendor,
         pm.category
-),
-
-inward_summary AS (
-    SELECT
-        pk.company_id_name AS company,
-        pm.product_vendor AS vendor,
-        pm.category,
-        SUM(pol.qty_received) AS inward_qty,
-        SUM(pol.qty_received * pm.lst_price) AS inward_value
-    FROM WT_LH_Silver.Odoo.stock_picking pk
-    LEFT JOIN WT_LH_Silver.Odoo.purchase_order po
-        ON pk.origin = po.name
-    LEFT JOIN WT_LH_Silver.Odoo.purchase_order_line pol
-        ON po.id = pol.order_id
-    LEFT JOIN product_master pm
-        ON CAST(pol.product_id AS VARCHAR(50)) = pm.product_id
-    WHERE pk.picking_type_code = 'incoming'
-      AND pk.state = 'done'
-      AND pk.company_id_name NOT IN (
-            'Saree Trails',
-            'Wedtree eStore Private Limited - HO'
-      )
-      AND pk.location_id_name = 'Partners/Vendors'
-      AND CAST(pk.date_done AS DATE) >= ?
-      AND CAST(pk.date_done AS DATE) <= ?
-    GROUP BY
-        pk.company_id_name,
-        pm.product_vendor,
-        pm.category
-),
-
+)""" + TRANSFER_CTES + f""",
 inventory_summary AS (
-    SELECT
-        sq.company_id_name AS company,
-        pm.product_vendor AS vendor,
-        pm.category,
-        SUM(sq.quantity) AS available_qty,
-        SUM(sq.quantity * pm.lst_price) AS available_value
+    SELECT sq.company_id_name AS company, pm.product_vendor AS vendor, pm.category,
+        SUM(sq.quantity) AS available_qty, SUM(sq.quantity * pm.lst_price) AS available_value
     FROM WT_LH_Silver.Odoo.stock_quant_n1 sq
-    LEFT JOIN product_master pm
-        ON CAST(sq.product_id AS VARCHAR(50)) = pm.product_id
-    WHERE sq.company_id_name NOT IN (
-            'Saree Trails',
-            'Wedtree eStore Private Limited - HO'
-      )
-    GROUP BY
-        sq.company_id_name,
-        pm.product_vendor,
-        pm.category
+    LEFT JOIN product_master pm ON CAST(sq.product_id AS VARCHAR(50)) = pm.product_id
+    WHERE sq.company_id_name NOT IN ('Saree Trails', 'Wedtree Estore private Limited - Saree Trails', 'Wedtree eStore Private Limited - Online')
+      AND sq.location_id_name NOT IN ({EXCLUDED_STOCK_LOCATIONS_SQL})
+    GROUP BY sq.company_id_name, pm.product_vendor, pm.category
 ),
-
-consolidated AS (
-    SELECT
-        COALESCE(s.vendor, i.vendor, inv.vendor) AS vendor,
-        COALESCE(s.category, i.category, inv.category) AS category,
-        COALESCE(s.sale_qty, 0) AS sale_qty,
-        COALESCE(s.sale_value, 0) AS sale_value,
-        COALESCE(inv.available_qty, 0) AS available_qty,
-        COALESCE(inv.available_value, 0) AS available_value,
-        COALESCE(i.inward_qty, 0) AS inward_qty,
-        COALESCE(i.inward_value, 0) AS inward_value,
-        COALESCE(s.company, i.company, inv.company) AS company
-    FROM sales_summary s
-    FULL OUTER JOIN inward_summary i
-        ON s.company = i.company
-       AND s.vendor = i.vendor
-       AND s.category = i.category
-    FULL OUTER JOIN inventory_summary inv
-        ON COALESCE(s.company, i.company) = inv.company
-       AND COALESCE(s.vendor, i.vendor) = inv.vendor
-       AND COALESCE(s.category, i.category) = inv.category
+metric_facts AS (
+    SELECT company, vendor, category, sale_qty, sale_value, 0 AS available_qty, 0 AS available_value,
+           0 AS inward_qty, 0 AS inward_value, 0 AS intransit_qty, 0 AS intransit_value,
+           0 AS outgoing_qty, 0 AS outgoing_value, 0 AS returns_qty, 0 AS returns_value
+    FROM sales_summary
+    UNION ALL
+    SELECT company, vendor, category, 0, 0, available_qty, available_value, 0, 0, 0, 0, 0, 0, 0, 0
+    FROM inventory_summary
+    UNION ALL
+    SELECT f.company, pm.product_vendor, f.category, 0, 0, 0, 0,
+        CASE WHEN f.kind = 'inward' THEN f.quantity ELSE 0 END,
+        CASE WHEN f.kind = 'inward' THEN f.value ELSE 0 END,
+        CASE WHEN f.kind = 'intransit' THEN f.quantity ELSE 0 END,
+        CASE WHEN f.kind = 'intransit' THEN f.value ELSE 0 END,
+        CASE WHEN f.kind = 'outgoing' THEN f.quantity ELSE 0 END,
+        CASE WHEN f.kind = 'outgoing' THEN f.value ELSE 0 END, 0, 0
+    FROM transfer_facts f
+    LEFT JOIN product_master pm ON f.product_id = pm.product_id
+    UNION ALL
+    SELECT f.company, pm.product_vendor, f.category, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, f.quantity, f.value
+    FROM return_facts f
+    LEFT JOIN product_master pm ON f.product_id = pm.product_id
 )
-
-SELECT
-    vendor AS Vendor,
-    category AS categ_id_name,
-    SUM(sale_qty) AS sale_qty,
-    SUM(sale_value) AS sale_value,
-    SUM(available_qty) AS available_qty,
-    SUM(available_value) AS available_value,
-    SUM(inward_qty) AS inward_qty,
-    SUM(inward_value) AS inward_value,
-    company AS company_id_name
-FROM consolidated
-GROUP BY
-    vendor,
-    category,
-    company
-ORDER BY
-    vendor,
-    category,
-    company;
+SELECT vendor AS Vendor, category AS categ_id_name, company AS company_id_name,
+    SUM(sale_qty) AS sale_qty, SUM(sale_value) AS sale_value,
+    SUM(available_qty) AS available_qty, SUM(available_value) AS available_value,
+    SUM(inward_qty) AS inward_qty, SUM(inward_value) AS inward_value,
+    SUM(intransit_qty) AS intransit_qty, SUM(intransit_value) AS intransit_value,
+    SUM(outgoing_qty) AS outgoing_qty, SUM(outgoing_value) AS outgoing_value,
+    SUM(returns_qty) AS returns_qty, SUM(returns_value) AS returns_value
+FROM metric_facts
+GROUP BY vendor, category, company
+ORDER BY vendor, category, company;
 """
 
 
 def build_query_and_params(start_str, end_str):
-    """Date range is the ONLY filter baked into SQL now. Params are
-    just the two date bounds, used twice (sales window, inward window)."""
-    params = [start_str, end_str, start_str, end_str]
+    """Bind the shared selected period once; inventory and ready receipts are snapshots."""
+    params = [start_str, end_str]
     return QUERY_TEMPLATE, params
 
 
 @st.cache_data(ttl=AGGREGATE_CACHE_TTL_SECONDS, show_spinner=False)
-def get_aggregate_data(conn_str, start_str, end_str, query_revision="include-unmatched-v1"):
-    """Fetch report totals including unmatched and missing categories. Cached for
+def get_aggregate_data(conn_str, start_str, end_str, query_revision="network-transfers-v2"):
+    """Fetch the supplied HO/store metric rules, retaining unmapped master categories. Cached for
     AGGREGATE_CACHE_TTL_SECONDS (6 hours), keyed on the connection
     string + date range + query revision. Every Vendor/Category/Company tweak below
     reuses this exact DataFrame — no new query."""
@@ -1504,8 +1622,14 @@ inventory_detail AS (
        AND sq.lot_id_name = smd.lot_number
     WHERE sq.company_id_name NOT IN (
         'Saree Trails',
-        'Wedtree eStore Private Limited - HO'
+        'Wedtree Estore private Limited - Saree Trails',
+        'Wedtree eStore Private Limited - Online'
     )
+      AND sq.location_id_name NOT IN (
+          'Physical Locations/Subcontracting Location',
+          'Physical Locations/Inter-warehouse transit',
+          'Virtual Locations/Production'
+      )
 )
 SELECT
     i.company,
@@ -1564,6 +1688,8 @@ pos_sales AS (
       AND po.user_id_name <> 'Administrator'
       AND pol.company_id_name NOT IN (
           'Saree Trails',
+          'Wedtree Estore private Limited - Saree Trails',
+          'Wedtree eStore Private Limited - Online',
           'Wedtree eStore Private Limited - HO'
       )
       AND po.config_id_name NOT IN (
@@ -2045,10 +2171,10 @@ def render_group_table(frame, keys, meta, state, sort_field, ascending, totals_f
                                  ascending=[ascending] + [True for key in keys if key != sort_field],
                                  na_position="last", kind="stable")
     headers = [{"categ_id_name": "Category", "Vendor": "Vendor", "company_id_name": "Store", "master_category": "Master category"}[key] for key in keys]
-    headers += ["Sold qty", "Sales value", "Available qty", "Available value", "Inward qty", "Inward value"]
+    headers += ["Sold qty", "Sales value", "Available qty", "Available value", "Inward qty", "Inward value", "Intransit qty", "Intransit value", "Outgoing qty", "Outgoing value", "Returns qty", "Returns value"]
     table_class = "report-table has-category" if "categ_id_name" in keys else "report-table"
     dimension_widths = {"categ_id_name": 260, "Vendor": 180, "master_category": 180, "company_id_name": 300}
-    widths = [dimension_widths[key] for key in keys] + [125, 160, 125, 160, 125, 160]
+    widths = [dimension_widths[key] for key in keys] + [125, 160] * (len(METRICS) // 2)
     table_width = sum(widths)
     html = [f'<div class="report-table-wrap"><table class="{table_class}" style="width:{table_width}px;min-width:{table_width}px"><colgroup>']
     html.extend(f'<col style="width:{width}px">' for width in widths)
@@ -2087,10 +2213,12 @@ _HIERARCHY_COMPONENT = st.components.v2.component(
     js="""
 export default function({data, parentElement, setStateValue}) {
     const root = parentElement.querySelector('.hierarchy-root');
-    const changed = root._reportHtml !== data.html;
+    const palette = JSON.stringify(data.ageColors);
+    const changed = root._reportHtml !== data.html || root._agePalette !== palette;
     if (changed) {
         root.innerHTML = data.html;
         root._reportHtml = data.html;
+        root._agePalette = palette;
         root._reportNodes = [...root.querySelectorAll('details')];
         root._reportRows = [...root.querySelectorAll('tr[data-ancestors]')].map(row => ({row, ancestors: JSON.parse(row.dataset.ancestors)}));
     }
@@ -2121,24 +2249,34 @@ export default function({data, parentElement, setStateValue}) {
                         body.dataset.ready = 'true';
                         const boxes = document.createElement('div');
                         boxes.className = 'quantity-age-boxes';
-                        boxes.style.cssText = 'display:flex;flex-wrap:nowrap;gap:4px;margin-top:6px';
+                        boxes.style.cssText = 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px;margin-top:5px;width:100%';
                         JSON.parse(body.dataset.quantities).forEach((qty, index) => {
                             const box = document.createElement('div');
-                            box.style.cssText = `background:${data.ageColors[index]};color:#111827;border:1px solid #9ca3af;border-radius:3px;padding:5px 7px;text-align:center;white-space:nowrap;min-width:54px`;
-                            box.title = data.ageBands[index] + ' days';
+                            box.style.cssText = `background:${data.ageColors[index]};color:#111827;border:1px solid #9ca3af;border-radius:3px;padding:4px 1px;text-align:center;min-width:0;display:flex;flex-direction:column;justify-content:center`;
+                            box.title = data.ageBands[index];
+                            const label = document.createElement('div');
+                            label.style.cssText = 'font-size:9px;line-height:12px;margin-bottom:2px;white-space:nowrap;min-width:0';
+                            label.textContent = '';
                             const value = document.createElement('div');
-                            value.style.cssText = 'font-size:15px;font-weight:700';
+                            value.style.cssText = 'font-size:11px;line-height:15px;font-weight:700;white-space:nowrap;min-width:0';
                             value.textContent = Number(qty).toLocaleString('en-IN', {minimumFractionDigits:0, maximumFractionDigits:0});
-                            box.append(value);
+                            box.append(label, value);
                             boxes.append(box);
                         });
                         body.append(boxes);
-                        if (Number(body.dataset.unknown)) {
-                            const unknown = document.createElement('div');
-                            unknown.textContent = 'Age unavailable: qty ' + Number(body.dataset.unknown).toLocaleString('en-IN', {maximumFractionDigits:0});
-                            unknown.title = 'The inward date is missing, the sale precedes inward, or the current-stock inward date is in the future. These quantities are excluded from the five age bands.';
-                            body.append(unknown);
-                        }
+                        // Fit both the age label and quantity to their box width.
+                        requestAnimationFrame(() => {
+                            [...boxes.children].forEach(box => {
+                                [...box.children].forEach((text, index) => {
+                                    let size = index === 0 ? 9 : 11;
+                                    text.style.fontSize = size + 'px';
+                                    while (text.scrollWidth > text.clientWidth && size > 6) {
+                                        size -= 0.5;
+                                        text.style.fontSize = size + 'px';
+                                    }
+                                });
+                            });
+                        });
                     }
                 }
                 return;
@@ -2179,12 +2317,12 @@ def render_hierarchy_table(frame, meta, state, sort_field, ascending, pivot_orde
 
 
 @st.cache_data(ttl=21600, max_entries=16, show_spinner=False)
-def build_hierarchy_content(frame, meta, sort_field, ascending, pivot_order):
+def build_hierarchy_content(frame, meta, sort_field, ascending, pivot_order, age_group_revision="four-compact-bands-v2"):
     dimensions = {"Store": ["company_id_name"], "Vendor": ["Vendor"],
                   "Category": ["master_category", "categ_id_name"]}
     levels = [key for name in pivot_order for key in dimensions[name]]
     headers = [" / ".join(pivot_order), "Sold qty", "Sales value", "Available qty",
-               "Available value", "Inward qty", "Inward value"]
+               "Available value", "Inward qty", "Inward value", "Intransit qty", "Intransit value", "Outgoing qty", "Outgoing value", "Returns qty", "Returns value"]
     visible_rows = []
     row_ancestors = []
     css = [".pivot-hierarchy tr[hidden] {display:none !important;} "
@@ -2192,12 +2330,17 @@ def build_hierarchy_content(frame, meta, sort_field, ascending, pivot_order):
            ".pivot-hierarchy summary {cursor:pointer;} "
            ".pivot-hierarchy .master-row,.pivot-hierarchy .grand-total {font-weight:700;} "
            ".pivot-hierarchy .grand-total td {border-bottom:2px solid #dddddd;} "]
-    markup = ['<div class="report-table-wrap"><table class="report-table pivot-hierarchy" style="table-layout:fixed;width:1450px;min-width:1450px"><colgroup><col style="width:360px">' + '<col style="width:181px">' * 6 + '</colgroup><thead><tr>']
+    markup = ['<div class="report-table-wrap"><table class="report-table pivot-hierarchy" style="table-layout:fixed;width:2532px;min-width:2532px"><colgroup><col style="width:360px">' + '<col style="width:181px">' * len(METRICS) + '</colgroup><thead><tr>']
     markup.extend(f"<th>{safe_html(header)}</th>" for header in headers)
     markup.append("</tr></thead><tbody>")
 
     def add_row(label, totals, classes, depth=0, toggle_id=None, visible=True, scope=None, row_id="total", ancestors=()):
-        visible_rows.append(["    " * depth + str(label)] + [float(totals[metric]) for metric in METRICS])
+        companies = scope["company_id_name"].dropna()
+        is_ho_only = not companies.empty and companies.eq(HO_COMPANY).all()
+        has_ho = companies.eq(HO_COMPANY).any()
+        def not_applicable(metric):
+            return (metric.startswith("sale_") and is_ho_only) or (metric.startswith("returns_") and not has_ho)
+        visible_rows.append(["    " * depth + str(label)] + [None if not_applicable(metric) else float(totals[metric]) for metric in METRICS])
         row_ancestors.append(ancestors)
         markup.append(f'<tr class="{classes}" data-ancestors="{safe_html(json.dumps(ancestors))}"' + (' hidden' if depth else '') + f'><td class="tree-cell" style="padding-left:{13 + depth * 22}px">')
         if toggle_id:
@@ -2207,9 +2350,12 @@ def build_hierarchy_content(frame, meta, sort_field, ascending, pivot_order):
             markup.append(safe_html(label))
         markup.append("</td>")
         for metric in METRICS:
+            if not_applicable(metric):
+                markup.append("<td></td>")
+                continue
             prefix = "₹" if metric.endswith("value") else ""
-            if metric in {"sale_qty", "inward_qty"}:
-                kind = "sales" if metric == "sale_qty" else "available"
+            if metric in {"sale_qty", "available_qty", "inward_qty", "intransit_qty", "outgoing_qty"}:
+                kind = {"sale_qty": "sales", "available_qty": "available", "inward_qty": "inward", "intransit_qty": "intransit", "outgoing_qty": "outgoing"}[metric]
                 age_id = f"age-{kind}-{row_id}"
                 markup.append(f'<td><details id="{age_id}" class="quantity-age-toggle"><summary title="Expand age bands">{float(totals[metric]):,.2f}</summary>')
                 markup.append(inline_quantity_age_html(scope, meta, kind))
@@ -2219,7 +2365,7 @@ def build_hierarchy_content(frame, meta, sort_field, ascending, pivot_order):
         markup.append("</tr>")
 
     css.append(".quantity-age-toggle {min-width:110px;position:relative;} .quantity-age-toggle>summary {white-space:nowrap;} "
-               ".quantity-age-body {width:100%;overflow-x:auto;padding:8px 0;white-space:normal;font-weight:400;}")
+               ".quantity-age-body {width:100%;min-width:0;padding:6px 0;white-space:normal;font-weight:400;}")
     add_row("Grand total", frame[METRICS].sum(), "grand-total", scope=frame)
     def render_level(group, depth, ancestors, path):
         key = levels[depth]
@@ -2268,7 +2414,7 @@ def render_main_report():
         reset_date_draft()
         st.session_state.date_preset = "Custom range"
     st.markdown("### Inventory purchase report")
-    date_area, report_controls = st.columns([2, 4], vertical_alignment="center", wrap=False)
+    date_area, report_controls = st.columns([2, 4], vertical_alignment="bottom", wrap=False)
     with date_area:
         with st.container(horizontal=True, horizontal_alignment="left"):
             applied_start, applied_end = st.session_state.applied_dates
@@ -2292,12 +2438,10 @@ def render_main_report():
             try:
                 conn_str = build_connection_string(SQL_ENDPOINT, DATABASE, CLIENT_ID, CLIENT_SECRET, TENANT_ID)
                 t0 = time.time()
-                raw = get_aggregate_data(conn_str, start_date.isoformat(), end_date.isoformat())
-                age_meta = dict(start_date=start_date, end_date=end_date)
-                raw = preload_quantity_ages(raw, age_meta)
+                raw, timings = load_report_parallel(conn_str, start_date, end_date, business_today())
                 st.session_state.raw_df = raw
                 st.session_state.raw_meta = dict(start_date=start_date, end_date=end_date,
-                                                fetched_at=datetime.now(), elapsed=time.time() - t0)
+                                                fetched_at=datetime.now(), elapsed=time.time() - t0, query_timings=timings)
                 st.session_state.applied_dates = (start_date, end_date)
                 if apply:
                     st.rerun()
@@ -2309,9 +2453,17 @@ def render_main_report():
     if raw is None:
         st.info("Open the date filter and click Apply to load the report.")
         return
+    if not set(METRICS).issubset(raw.columns):
+        st.info("Click Apply in the date filter to load the new transfer and returns columns.")
+        return
     meta = st.session_state.raw_meta
+    if meta.get("query_timings"):
+        with st.sidebar.expander("Last load timings"):
+            st.caption(f"Total load: {meta['elapsed']:.1f} seconds. Query times overlap.")
+            st.dataframe(pd.DataFrame([{"Query": name, "Seconds": round(seconds, 2)}
+                                       for name, seconds in meta["query_timings"].items()]), hide_index=True)
     raw = add_master_category(raw, mapping, "categ_id_name")
-    labels = {"categ_id_name": "Category", "Vendor": "Vendor", "sale_qty": "Sold quantity", "sale_value": "Sales value", "available_qty": "Available quantity", "available_value": "Available value", "inward_qty": "Inward quantity", "inward_value": "Inward value"}
+    labels = {"categ_id_name": "Category", "Vendor": "Vendor", "sale_qty": "Sold quantity", "sale_value": "Sales value", "available_qty": "Available quantity", "available_value": "Available value", "inward_qty": "Inward quantity", "inward_value": "Inward value", "intransit_qty": "Intransit quantity", "intransit_value": "Intransit value", "outgoing_qty": "Outgoing quantity", "outgoing_value": "Outgoing value", "returns_qty": "Returns quantity", "returns_value": "Returns value"}
     view = "Category hierarchy"
     if "report_sort" not in st.session_state:
         st.session_state.report_sort = qp.get("r_sort", "categ_id_name") if qp.get("r_sort") in labels else "categ_id_name"
@@ -2338,10 +2490,14 @@ def render_report_section(df, meta, sort_field, ascending, report_controls):
     state = {}
     pivot_orders = [order for count in (1, 2, 3) for order in permutations(("Store", "Vendor", "Category"), count)]
     with report_controls:
+        legend = '<div style="display:flex;justify-content:flex-end;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;"><span>Age (days):</span>'
+        for band in AGE_BANDS:
+            legend += f'<span style="background:{AGE_COLORS[band]};color:#111827;padding:3px 7px;border-radius:3px;white-space:nowrap;">{safe_html(band)}</span>'
+        st.markdown(legend + '</div>', unsafe_allow_html=True)
         with st.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", wrap=False):
             pivot_order = st.selectbox("Pivot order", pivot_orders, index=pivot_orders.index(("Category", "Vendor", "Store")), format_func=lambda order: " \u2192 ".join(order), key="pivot_order", width=360, label_visibility="collapsed")
             download_toolbar = st.container(horizontal=True, width="content", wrap=False)
-    st.caption("Sold qty: Days from original inward to sale; selected period.  |  Inward qty age panel: Current stock; days since original inward (not period receipts).")
+    st.caption("Sold, Inward and Outgoing: selected period; age at sale or transfer completion from original HO inward. Available and Intransit: current snapshot; age today from original HO inward. Returns: HO vendor deliveries in the selected period; no age split.")
     export = render_hierarchy_table(df, meta, state, sort_field, ascending, pivot_order)
     # Deferred downloads run in a worker without Streamlit's session context.
     # Share a plain holder so table-only reruns can update the current snapshot.
@@ -2353,16 +2509,16 @@ def render_report_section(df, meta, sort_field, ascending, report_controls):
         st.download_button("PDF", lambda: report_pdf(download_snapshot["frame"], meta["start_date"], meta["end_date"], view, {}, table_only=True), filename + ".pdf", "application/pdf", icon=":material/download:", width="content", on_click="ignore", help="Downloads the current table, including only expanded rows.")
 
 
-AGE_BANDS = ["0–90", "91–180", "181–270", "271–360", ">360"]
-AGE_COLORS = dict(zip(AGE_BANDS, ["#dcfce7", "#dbeafe", "#fef9c3", "#ffedd5", "#fee2e2"]))
+AGE_BANDS = ["0–90", "91–180", "181–360", ">360 / no age"]
+AGE_COLORS = dict(zip(AGE_BANDS, ["#4ade80", "#facc15", "#fb923c", "#f87171"]))
 
 
 def quantity_age_summary(frame, age_column, quantity_column):
-    """Bucket detail rows before consolidation; count distinct product/lot pairs."""
+    """Use four age groups, including missing/invalid dates in the final red group."""
     detail = frame.copy()
     ages = pd.to_numeric(detail[age_column], errors="coerce")
-    detail["Age band"] = pd.cut(ages, [-1, 90, 180, 270, 360, float("inf")], labels=AGE_BANDS)
-    detail.loc[ages.lt(0), "Age band"] = pd.NA
+    detail["Age band"] = pd.cut(ages, [-1, 90, 180, 360, float("inf")], labels=AGE_BANDS)
+    detail.loc[ages.isna() | ages.lt(0), "Age band"] = AGE_BANDS[-1]
     rows = []
     for band in AGE_BANDS:
         group = detail[detail["Age band"].eq(band)]
@@ -2377,8 +2533,10 @@ def inline_quantity_age_html(scope, meta, kind):
     """Send compact totals; create the five boxes only when opened in the browser."""
     if f"age_{kind}_0" not in scope:
         return '<div class="quantity-age-body">Click Apply in the date filter once to load age quantities.</div>'
-    quantities = [float(scope[f"age_{kind}_{index}"].sum()) for index in range(5)]
+    # Merge the preloaded SQL buckets in memory, including existing session data.
+    source = [float(scope[f"age_{kind}_{index}"].sum()) for index in range(5)]
     unknown = float(scope[f"age_{kind}_unknown"].sum())
+    quantities = [source[0], source[1], source[2] + source[3], source[4] + unknown]
     caption = "Days from original inward to sale; selected period" if kind == "sales" else "Current stock; days since original inward (not period receipts)"
     return (f'<div class="quantity-age-body" data-quantities="{safe_html(json.dumps(quantities))}" '
             f'data-unknown="{unknown}" data-caption="{safe_html(caption)}"></div>')
@@ -2397,7 +2555,7 @@ def quantity_age_query(kind, meta, reference):
         age = "DATEDIFF(DAY, smd.stock_move_date, s.sold_date)"
         reference_join = ""
         params = [meta["start_date"].isoformat(), meta["end_date"].isoformat()]
-        condition = "1 = 1"
+        condition = "p.category IS NOT NULL AND LOWER(p.category) NOT LIKE '%admin%'"
     else:
         ctes = AVAILABLE_SQL[AVAILABLE_SQL.index(",\nstock_min_date AS ("):AVAILABLE_SQL.index("\nSELECT\n    i.company,")]
         source = "inventory_detail i"
@@ -2419,6 +2577,50 @@ def quantity_age_query(kind, meta, reference):
     return sql, params
 
 
+
+def transfer_age_query(meta, reference):
+    """Allocate each supplied transfer quantity to its recorded lots without changing totals."""
+    product = PRODUCT_BASE[:PRODUCT_BASE.index(",\nproduct_images AS (")]
+    sql = "WITH report_dates AS (SELECT CAST(? AS DATE) AS start_date, CAST(? AS DATE) AS end_date),\n" + product.removeprefix("\nWITH ")
+    sql += TRANSFER_CTES + STOCK_RECEIPT_CTE + """,
+transfer_lots AS (
+    SELECT ml.picking_key, ml.product_key, NULLIF(NULLIF(ml.lot_id_name, 'False'), '') AS lot_number,
+        SUM(ABS(COALESCE(ml.quantity_product_uom, ml.quantity, 0))) AS lot_qty
+    FROM normalized_move_lines ml
+    INNER JOIN (SELECT DISTINCT picking_id, product_id FROM transfer_facts) f
+        ON ml.picking_key = f.picking_id AND ml.product_key = f.product_id
+    WHERE ml.state <> 'cancel' OR ml.state IS NULL
+    GROUP BY ml.picking_key, ml.product_key, NULLIF(NULLIF(ml.lot_id_name, 'False'), '')
+),
+transfer_age_matches AS (
+    SELECT f.*, l.lot_number, l.lot_qty,
+        SUM(l.lot_qty) OVER (PARTITION BY f.picking_id, f.product_id, f.kind) AS matched_qty,
+        COUNT(*) OVER (PARTITION BY f.picking_id, f.product_id, f.kind) AS matched_rows
+    FROM transfer_facts f
+    LEFT JOIN transfer_lots l ON f.picking_id = l.picking_key AND f.product_id = l.product_key
+),
+transfer_ages AS (
+    SELECT f.company, p.vendor, f.category, f.kind,
+        f.quantity * CASE WHEN f.matched_qty > 0 THEN 1.0 * f.lot_qty / f.matched_qty
+                          ELSE 1.0 / f.matched_rows END AS quantity,
+        DATEDIFF(DAY, smd.stock_move_date,
+                 CASE WHEN f.kind = 'intransit' THEN ref.age_reference ELSE f.event_date END) AS age_days
+    FROM transfer_age_matches f
+    LEFT JOIN product_base p ON f.product_id = p.product_id
+    LEFT JOIN stock_min_date smd ON f.product_id = smd.product_id AND f.lot_number = smd.lot_number
+    CROSS JOIN (SELECT CAST(? AS DATE) AS age_reference) ref
+)
+SELECT company AS company_id_name, vendor AS Vendor, category AS categ_id_name,
+"""
+    expressions = []
+    for kind in ("inward", "intransit", "outgoing"):
+        for index, (lower, upper) in enumerate([(0, 90), (91, 180), (181, 270), (271, 360), (361, None)]):
+            bounds = f"age_days >= {lower}" if upper is None else f"age_days BETWEEN {lower} AND {upper}"
+            expressions.append(f"SUM(CASE WHEN kind = '{kind}' AND {bounds} THEN quantity ELSE 0 END) AS age_{kind}_{index}")
+        expressions.append(f"SUM(CASE WHEN kind = '{kind}' AND (age_days IS NULL OR age_days < 0) THEN quantity ELSE 0 END) AS age_{kind}_unknown")
+    sql += ",\n".join(expressions) + "\nFROM transfer_ages GROUP BY company, vendor, category"
+    return sql, [meta["start_date"].isoformat(), meta["end_date"].isoformat(), reference.isoformat()]
+
 def preload_quantity_ages(raw, meta):
     """Download only one small age-summary row per store/vendor/category."""
     result = raw.copy()
@@ -2430,6 +2632,11 @@ def preload_quantity_ages(raw, meta):
         columns = [f"age_{kind}_{index}" for index in [0, 1, 2, 3, 4, "unknown"]]
         result = result.merge(totals[keys + columns], on=keys, how="left", validate="one_to_one")
         result[columns] = result[columns].fillna(0)
+    sql, params = transfer_age_query(meta, business_today())
+    totals = run_query(conn_str, sql, params)
+    columns = [f"age_{kind}_{index}" for kind in ("inward", "intransit", "outgoing") for index in [0, 1, 2, 3, 4, "unknown"]]
+    result = result.merge(totals[keys + columns], on=keys, how="left", validate="one_to_one")
+    result[columns] = result[columns].fillna(0)
     return result
 
 
@@ -2465,6 +2672,8 @@ def drill_query(kind, qp):
         params.extend(values_params)
     if kind == "available":
         conditions.append("i.available_inventory <> 0")
+    else:
+        conditions.append("p.category IS NOT NULL AND LOWER(p.category) NOT LIKE '%admin%'")
     return sql[:begin] + "WHERE " + " AND ".join(conditions) + sql[finish:], params
 
 
